@@ -479,15 +479,29 @@ def build_granular_sessions(
                 ))
             focus_request = f"""Review the file `{relative}` now, using the complete service source already loaded for context. The repeated file contents immediately precede this request. Keep the audit scope focused on security defects whose root cause is in this file; use other files to confirm callers, data flow, intended behavior, and exploitability. Do not report a finding merely because this file handles sensitive data or calls a helper. Do not write a patch or solver.
 
-Check all relevant vulnerability classes for this file, including authorization/object ownership, injection, path/archive/upload handling, unsafe parsing or deserialization, cryptography/session mistakes, information exposure, resource exhaustion, and races. For each confirmed finding, trace exact source evidence and the complete attacker path; separate unresolved leads and rejected candidates.
+Review every function, handler, parser, and security-sensitive branch in this file. Work through these passes using the complete service source already in context:
+1. Enumerate the routes, commands, callbacks, exported functions, and other entry points declared or implemented here. Trace their callers and callees across files to the final database, file, process, network, or response sink.
+2. Trace attacker-controlled values through validation and authorization. Check ownership, tenant boundaries, role checks, object IDs, and authorization of every nested or enriched record.
+3. Trace sensitive fields from storage and writes through every reader, DTO, serializer, event, log, export, and user-visible derived field. Confirm what reaches the final sink.
+4. Check injection, unsafe parsing/deserialization, path traversal, upload and archive handling, cryptography and sessions, information exposure, resource limits, races, and state or business-logic transitions where relevant to this file.
+5. For every candidate, give the exact source path, function, branch, arguments, preconditions, and end-to-end attacker impact. Try to falsify it against alternate paths and intended behavior. Put uncertain claims under unresolved leads.
+6. Account for every function or surface reviewed, including those with no confirmed issue. Do not stop after the first finding and do not write patches or solvers during this review.
 
-Return exactly one JSON object with keys `file`, `confirmed_findings`, `unresolved_leads`, and `reviewed_surfaces`. Each finding must have `id`, `title`, `summary`, `evidence`, `preconditions`, `attack_path`, `impact`, and `source_locations`. Use empty arrays when appropriate. Do not include findings rooted in another file. End with the receipt line supplied after this prompt."""
+Return exactly one JSON object with keys `file`, `confirmed_findings`, `unresolved_leads`, and `reviewed_surfaces`. Each finding must have `id`, `title`, `summary`, `evidence`, `preconditions`, `attack_path`, `impact`, and `source_locations`. Make `reviewed_surfaces` a list naming every reviewed function or surface and its result. Use empty arrays when appropriate. Do not include findings rooted in another file. End with the receipt line supplied after this prompt."""
             messages.append(pack_message(
                 f"focus-review-{group_index:03d}-{file_index:03d}",
                 focus_request,
                 message_chars,
                 final=True,
             ))
+        solution_prompt = build_same_session_solution_prompt(task_root.name, "both", None)
+        solution_prompt += "\n\nThe preceding per-file reports can repeat the same root cause. Reconcile them against the complete source context, merge duplicate descriptions of one flaw, and keep separate root causes as separate findings."
+        messages.append(pack_message(
+            "granular-solutions",
+            solution_prompt,
+            message_chars,
+            final=True,
+        ))
         sessions.append((f"granular-{group_index:03d}", messages))
     return sessions
 
@@ -1702,7 +1716,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
 
                 if provider == "qwen":
                     resume_label = messages[resume_after - 1][0] if resume_after else ""
-                    initial_mode = "Thinking" if resume_label in {"audit-policy-provenance", "final-findings", "structured-findings"} or resume_label.startswith(("focus-review-", "solver-patch-")) else "Fast"
+                    initial_mode = "Thinking" if resume_label in {"audit-policy-provenance", "final-findings", "structured-findings", "solution-followup", "granular-solutions"} or resume_label.startswith(("focus-review-", "solver-patch-")) else "Fast"
                     if not set_qwen_thinking_mode(client, initial_mode):
                         print(f"{context_name}: could not select {initial_mode} mode; continuing with the current mode.", file=sys.stderr, flush=True)
 
@@ -1723,7 +1737,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                         previous_material,
                         None,
                         record_resume_events,
-                        final_response=previous_label == "final-findings",
+                        final_response=previous_label in {"final-findings", "structured-findings", "solution-followup", "granular-solutions"},
                         provider=provider,
                         model=desired_model,
                         already_submitted=True,
@@ -1743,7 +1757,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                             (trace_path.parent / f"{provider.upper()}_{pass_name}_{context_name}.md").write_text(previous_reply["answer"].rstrip() + "\n", encoding="utf-8")
                         elif previous_label == "final-findings":
                             (trace_path.parent / f"{provider.upper()}_FINDINGS_{context_name}.md").write_text(previous_reply["answer"].rstrip() + "\n", encoding="utf-8")
-                        elif previous_label.startswith(("focus-review-", "solver-patch-")) or previous_label in {"context-ready", "solution-followup"}:
+                        elif previous_label.startswith(("focus-review-", "solver-patch-")) or previous_label in {"context-ready", "solution-followup", "granular-solutions"}:
                             answer_path = trace_path.parent / f"{provider.upper()}_{previous_label}_{context_name}.md"
                             answer_path.write_text(previous_reply["answer"].rstrip() + "\n", encoding="utf-8")
                             print(f"{context_name}: saved response to {answer_path}.", flush=True)
@@ -1777,7 +1791,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                         print(f"{context_name}: challenge appeared before send; stopped without submitting the draft.", file=sys.stderr, flush=True)
                         break
                     if provider == "qwen":
-                        desired_mode = "Thinking" if label in {"audit-policy-provenance", "final-findings", "structured-findings"} or label.startswith(("focus-review-", "solver-patch-")) else "Fast"
+                        desired_mode = "Thinking" if label in {"audit-policy-provenance", "final-findings", "structured-findings", "solution-followup", "granular-solutions"} or label.startswith(("focus-review-", "solver-patch-")) else "Fast"
                         if not set_qwen_thinking_mode(client, desired_mode):
                             print(f"{context_name}: could not select {desired_mode} mode; continuing with the current mode.", file=sys.stderr, flush=True)
                         if not wait_for_chat_ready(client, args.captcha_wait, stable_seconds=2.0):
@@ -1805,7 +1819,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                         material,
                         prior_patch_count,
                         record_live_events,
-                        final_response=label == "final-findings",
+                        final_response=label in {"final-findings", "structured-findings", "solution-followup", "granular-solutions"},
                         provider=provider,
                         model=desired_model,
                     )
@@ -1861,7 +1875,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                                 fallback_path = trace_path.parent / f"{provider.upper()}_FINDINGS_{context_name}.md"
                                 fallback_path.write_text(reply["answer"].rstrip() + "\n", encoding="utf-8")
                                 print(f"{context_name}: model response was not valid findings JSON ({exc}); saved raw reply to {fallback_path}.", file=sys.stderr, flush=True)
-                    if label.startswith(("focus-review-", "solver-patch-")) or label in {"context-ready", "solution-followup"}:
+                    if label.startswith(("focus-review-", "solver-patch-")) or label in {"context-ready", "solution-followup", "granular-solutions"}:
                         reply = capture_provider_reply(client, provider)
                         if reply and isinstance(reply.get("answer"), str):
                             answer_path = trace_path.parent / f"{provider.upper()}_{label}_{context_name}.md"
@@ -1890,7 +1904,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
 
 def add_launch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task", required=True, type=task_slug, help="short task label, such as AML-1")
-    parser.add_argument("--provider", choices=tuple(PROVIDERS), action="append", help="repeat to open both sites; default: both")
+    parser.add_argument("--provider", choices=tuple(PROVIDERS), action="append", help="choose qwen or zai; repeat to use both (default: qwen)")
     parser.add_argument("--replicas", type=int, default=1, help="independent contexts per provider (default: 1)")
     parser.add_argument("--browser", help="Chromium-based browser executable; auto-detected by default")
     parser.add_argument("--captcha-wait", type=int, default=180, help="seconds to wait for a composer, allowing manual CAPTCHA solving")
@@ -1923,21 +1937,25 @@ def run_folder_command(args: argparse.Namespace) -> int:
         raise SystemExit(f"Task folder does not exist or is not a directory: {task_root}")
     if args.message_chars < 4_000 or args.max_file_bytes < 1:
         raise SystemExit("--message-chars must be at least 4000 and --max-file-bytes must be positive")
-    if args.command in {"audit", "context"} and (args.replicas < 1 or args.captcha_wait < 1 or args.wait_after_submit < 0):
-        raise SystemExit("--replicas and --captcha-wait must be positive; --wait-after-submit cannot be negative")
-    if args.command == "audit" and args.parallel_sessions < 1:
-        raise SystemExit("--parallel-sessions must be positive")
+    if args.command in {"audit", "context"} and (args.captcha_wait < 1 or args.wait_after_submit < 0):
+        raise SystemExit("--captcha-wait must be positive; --wait-after-submit cannot be negative")
     if getattr(args, "resume_after", 0) and not getattr(args, "resume_from", None):
         raise SystemExit("--resume-after requires --resume-from so the original message markers are preserved")
     if getattr(args, "granulize", None) is not None and args.granulize < 1:
         raise SystemExit("--granulize must be a positive number of focused files per session")
-    if getattr(args, "granulize", None) is not None and getattr(args, "structured_findings", False):
-        raise SystemExit("--structured-findings is for whole-service audits; granular reviews already return per-file JSON")
+    if getattr(args, "granulize", None) is not None and (
+        getattr(args, "structured_findings", False)
+        or getattr(args, "with_solvers", False)
+        or getattr(args, "separate_solvers", False)
+    ):
+        raise SystemExit("--granulize already adds a solver/patch follow-up to each granular chat")
+    if getattr(args, "separate_solvers", False) and getattr(args, "resume_after", 0):
+        raise SystemExit("--separate-solvers cannot be combined with --resume-after")
     if getattr(args, "granulize", None) is not None and getattr(args, "resume_after", 0):
         raise SystemExit("--granulize cannot be combined with --resume-after")
 
     message_chars = args.message_chars
-    providers = getattr(args, "provider", None) or list(PROVIDERS)
+    providers = getattr(args, "provider", None) or ["qwen"]
     if args.command in {"audit", "context"} and "qwen" in providers and message_chars > QWEN_MAX_MESSAGE_CHARS:
         print(f"Qwen recommends text-file upload above {QWEN_MAX_MESSAGE_CHARS:,} characters; limiting turns to that size.")
         message_chars = QWEN_MAX_MESSAGE_CHARS
@@ -1946,8 +1964,18 @@ def run_folder_command(args: argparse.Namespace) -> int:
         message_chars,
         args.max_file_bytes,
         getattr(args, "review_focus", None),
-        structured_findings=getattr(args, "structured_findings", False),
+        structured_findings=(
+            getattr(args, "structured_findings", False)
+            or getattr(args, "separate_solvers", False)
+        ),
     )
+    if getattr(args, "with_solvers", False):
+        full_prompts.append(pack_message(
+            "solution-followup",
+            build_same_session_solution_prompt(task_root.name, "both", None),
+            message_chars,
+            final=True,
+        ))
     session_plans: list[tuple[str, list[tuple[str, str]]]] | None = None
     if args.command == "context":
         session_plans = [("context", build_context_chat_prompts(task_root, full_prompts, message_chars))]
@@ -1955,6 +1983,7 @@ def run_folder_command(args: argparse.Namespace) -> int:
         files, second_skipped = collect_task_files(task_root, args.max_file_bytes)
         skipped = sorted(set(skipped) | set(second_skipped))
         session_plans = build_granular_sessions(task_root, files, full_prompts, args.granulize, message_chars)
+        print(f"Granular mode: {len(files)} files, {args.granulize} per chat, {len(session_plans)} chats in parallel.")
     else:
         session_plans = [("audit", full_prompts)]
 
@@ -1992,7 +2021,7 @@ def run_folder_command(args: argparse.Namespace) -> int:
     print(f"Session plans: {len(session_plans)}; total message characters: {content_chars:,}; maximum single message: {maximum_message:,}")
     print(f"Prompt files: {output}")
     if args.command in {"audit", "context"}:
-        print(f"Will open {len(providers) * args.replicas * len(session_plans)} independent browser context(s), with one conversation per context.")
+        print(f"Will open {len(providers) * len(session_plans)} browser session(s), with one conversation per session.")
     if getattr(args, "benchmark", False):
         if benchmark_family:
             print(f"Local {benchmark_family} ground-truth checklist written separately; it is not sent to chats.")
@@ -2006,7 +2035,7 @@ def run_folder_command(args: argparse.Namespace) -> int:
     launch_args = argparse.Namespace(
         task=task_slug(task_root.name),
         provider=providers,
-        replicas=args.replicas,
+        replicas=1,
         browser=args.browser,
         profile_root=args.profile_root,
         captcha_wait=args.captcha_wait,
@@ -2014,8 +2043,8 @@ def run_folder_command(args: argparse.Namespace) -> int:
         attach_profile=getattr(args, "attach_profile", None),
         attach_port=getattr(args, "attach_port", None),
         resume_after=getattr(args, "resume_after", 0),
-        qwen_model=args.qwen_model,
-        zai_model=args.zai_model,
+        qwen_model=getattr(args, "qwen_model", DEFAULT_MODELS["qwen"]),
+        zai_model=getattr(args, "zai_model", DEFAULT_MODELS["zai"]),
     )
     def run_session(session_name: str, prompts: list[tuple[str, str]]) -> int:
         session_output = output if len(session_plans) == 1 else output / session_name
@@ -2028,21 +2057,63 @@ def run_folder_command(args: argparse.Namespace) -> int:
         print(f"Sanitized traffic metadata: {trace_path}", flush=True)
         return result
 
-    parallelism = min(len(session_plans), max(1, getattr(args, "parallel_sessions", 1)))
+    parallelism = len(session_plans)
     failures = 0
     if parallelism == 1:
         for session_name, prompts in session_plans:
             failures += run_session(session_name, prompts)
     else:
-        print(f"Running up to {parallelism} independent review sessions concurrently.", flush=True)
+        print(f"Running all {parallelism} independent review sessions concurrently.", flush=True)
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
             futures = [executor.submit(run_session, session_name, prompts) for session_name, prompts in session_plans]
             for future in as_completed(futures):
                 failures += future.result()
     if args.command == "context":
         print("The prefilled chat context remains open for your questions.")
+    elif getattr(args, "granulize", None) is not None:
+        print("Each granular chat completed its file reviews and requested solver and patch material in that same chat.")
+    elif getattr(args, "with_solvers", False):
+        print("The audit, solver, and patch replies are in the same browser chat.")
+    elif getattr(args, "separate_solvers", False):
+        print("The audit is complete. Solver and patch chats will open for each finding.")
     else:
-        print("Findings are saved locally; completed chats stay open for review.")
+        print("The audit is complete. Its browser chat remains open so you can discuss the results.")
+
+    if getattr(args, "separate_solvers", False):
+        if failures:
+            print("At least one audit chat failed. Skipping automatic per-finding solver/patch chats.", file=sys.stderr)
+            return 1
+        for provider in providers:
+            findings_path = output / f"{provider.upper()}_FINDINGS_{provider}-1.json"
+            if not findings_path.is_file():
+                raise SystemExit(f"Structured findings were not saved for {provider}. See the audit output at {output}.")
+            findings_text = findings_path.read_text(encoding="utf-8")
+            try:
+                raw_findings = json.loads(findings_text)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Saved findings from {provider} are not valid JSON: {exc}") from None
+            if not isinstance(raw_findings, dict) or not isinstance(raw_findings.get("findings"), list):
+                raise SystemExit(f"Saved findings from {provider} do not contain a findings array.")
+            if not raw_findings["findings"]:
+                print(f"{provider}: audit found no confirmed findings, so no solver/patch chats were opened.")
+                continue
+            parse_findings_json(findings_text)
+            solve_args = argparse.Namespace(
+                folder=task_root,
+                findings_json=findings_path,
+                out=output / f"{provider.upper()}-SOLUTIONS",
+                message_chars=message_chars,
+                max_file_bytes=args.max_file_bytes,
+                provider=[provider],
+                replicas=1,
+                browser=args.browser,
+                profile_root=args.profile_root,
+                captcha_wait=args.captcha_wait,
+                wait_after_submit=args.wait_after_submit,
+                qwen_model=getattr(args, "qwen_model", DEFAULT_MODELS["qwen"]),
+                zai_model=getattr(args, "zai_model", DEFAULT_MODELS["zai"]),
+            )
+            failures += run_solve_command(solve_args)
     return 1 if failures else 0
 
 
@@ -2110,10 +2181,8 @@ def run_solve_command(args: argparse.Namespace) -> int:
         raise SystemExit(f"Task folder does not exist or is not a directory: {task_root}")
     if args.message_chars < 4_000 or args.max_file_bytes < 1:
         raise SystemExit("--message-chars must be at least 4000 and --max-file-bytes must be positive")
-    if args.replicas < 1 or args.captcha_wait < 1 or args.wait_after_submit < 0:
-        raise SystemExit("--replicas and --captcha-wait must be positive; --wait-after-submit cannot be negative")
-    if args.parallel_sessions < 1:
-        raise SystemExit("--parallel-sessions must be positive")
+    if args.captcha_wait < 1 or args.wait_after_submit < 0:
+        raise SystemExit("--captcha-wait must be positive; --wait-after-submit cannot be negative")
     findings_data = read_findings_json(args.findings_json)
     message_chars = min(args.message_chars, QWEN_MAX_MESSAGE_CHARS) if "qwen" in args.provider else args.message_chars
     full_prompts, skipped = build_audit_prompts(task_root, message_chars, args.max_file_bytes)
@@ -2132,13 +2201,13 @@ def run_solve_command(args: argparse.Namespace) -> int:
         (output / "SKIPPED_FILES.md").write_text("# Files omitted from prompts\n\n" + "\n".join(f"- `{item}`" for item in skipped) + "\n", encoding="utf-8")
     print(f"Prepared {len(sessions)} finding-specific context plan(s) from {task_root}.")
     print(f"Each plan reloads the complete service context, then asks for that finding's solver and patch: {output}")
-    print(f"Will open {len(args.provider) * args.replicas * len(sessions)} independent browser context(s).")
+    print(f"Will open {len(args.provider) * len(sessions)} browser session(s), one per finding and provider.")
     def run_solution_session(session_name: str, prompts: list[tuple[str, str]]) -> int:
         session_output = output / session_name
         launch_args = argparse.Namespace(
             task=task_slug(f"{task_root.name}-{session_name}"),
             provider=args.provider,
-            replicas=args.replicas,
+            replicas=1,
             browser=args.browser,
             profile_root=args.profile_root,
             captcha_wait=args.captcha_wait,
@@ -2153,13 +2222,13 @@ def run_solve_command(args: argparse.Namespace) -> int:
         print(f"Starting {session_name}.", flush=True)
         return launch_sequence(launch_args, prompts, trace_path)
 
-    parallelism = min(len(sessions), max(1, args.parallel_sessions))
+    parallelism = len(sessions)
     failures = 0
     if parallelism == 1:
         for session_name, prompts in sessions:
             failures += run_solution_session(session_name, prompts)
     else:
-        print(f"Running up to {parallelism} finding-specific sessions concurrently.", flush=True)
+        print(f"Running all {parallelism} finding-specific sessions concurrently.", flush=True)
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
             futures = [executor.submit(run_solution_session, session_name, prompts) for session_name, prompts in sessions]
             for future in as_completed(futures):
@@ -2173,6 +2242,8 @@ class CLIHelpFormatter(argparse.RawDescriptionHelpFormatter):
 
     def _get_help_string(self, action: argparse.Action) -> str:
         help_text = super()._get_help_string(action)
+        if help_text == argparse.SUPPRESS:
+            return help_text
         if (
             not action.option_strings
             or action.default is None
@@ -2186,55 +2257,172 @@ class CLIHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return f"{help_text} (default: %(default)s)"
 
 
-def main() -> int:
+TUI_WORKFLOWS = (
+    "Audit, then get solvers and patches in the same chat",
+    "Audit, then open one solver/patch chat per finding",
+    "Deep file-by-file audit, then solutions in each chat",
+    "Load service context for a free discussion",
+    "Audit only, then discuss the results in the same chat",
+)
+
+
+def choose_tui_workflow() -> int:
+    try:
+        import curses
+    except ImportError:
+        curses = None
+
+    if curses is not None:
+        def draw_menu(screen: object) -> int:
+            terminal = screen
+            terminal.keypad(True)
+            curses.curs_set(0)
+            try:
+                curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            except curses.error:
+                pass
+            selected = 0
+            first_option_row = 3
+            while True:
+                terminal.erase()
+                height, width = terminal.getmaxyx()
+                lines = [
+                    "Choose a workflow",
+                    "Use the arrow keys and Enter, or click an option.",
+                    "",
+                    *[f"{'>' if index == selected else ' '} {index + 1}. {label}" for index, label in enumerate(TUI_WORKFLOWS)],
+                    "",
+                    "Press Q or Esc to quit.",
+                ]
+                for row, line in enumerate(lines[:height]):
+                    terminal.addnstr(row, 1, line, max(1, width - 2))
+                terminal.refresh()
+                key = terminal.getch()
+                if key in (curses.KEY_UP, ord("k")):
+                    selected = (selected - 1) % len(TUI_WORKFLOWS)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    selected = (selected + 1) % len(TUI_WORKFLOWS)
+                elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+                    return selected
+                elif key in (ord("q"), ord("Q"), 27):
+                    return -1
+                elif key == curses.KEY_MOUSE:
+                    try:
+                        _, mouse_y, _, _, state = curses.getmouse()
+                    except curses.error:
+                        continue
+                    click_states = (
+                        curses.BUTTON1_CLICKED
+                        | curses.BUTTON1_PRESSED
+                        | curses.BUTTON1_RELEASED
+                    )
+                    option_index = mouse_y - first_option_row
+                    if state & click_states and 0 <= option_index < len(TUI_WORKFLOWS):
+                        return option_index
+
+        try:
+            return curses.wrapper(draw_menu)
+        except (OSError, curses.error):
+            pass
+
+    def text_menu() -> int:
+        print("Choose a workflow")
+        for index, label in enumerate(TUI_WORKFLOWS, 1):
+            print(f"  {index}. {label}")
+        while True:
+            choice = input("Workflow number (or Q to quit): ").strip().lower()
+            if choice == "q":
+                return -1
+            if choice.isdigit() and 1 <= int(choice) <= len(TUI_WORKFLOWS):
+                return int(choice) - 1
+            print(f"Enter a number from 1 to {len(TUI_WORKFLOWS)}.")
+    return text_menu()
+
+
+def run_tui() -> int:
+    workflow = choose_tui_workflow()
+    if workflow < 0:
+        return 0
+    folder = input("Task folder path: ").strip()
+    if not folder:
+        raise SystemExit("A task folder path is required")
+    print("Provider options")
+    print("  1. Qwen (default)")
+    print("  2. Z.ai")
+    print("  3. Both")
+    provider_names = {"1": ["qwen"], "2": ["zai"], "3": ["qwen", "zai"]}
+    while True:
+        provider_choice = input("Provider number: ").strip() or "1"
+        if provider_choice in provider_names:
+            break
+        print("Choose provider 1, 2, or 3.")
+
+    command = ["audit", "--folder", folder]
+    if workflow == 2:
+        while True:
+            files_per_session = input("Files reviewed by each session (1 means one file per session): ").strip() or "1"
+            if files_per_session.isdigit() and int(files_per_session) > 0:
+                break
+            print("Enter a positive number of files per session.")
+        command.extend(["--granulize", files_per_session])
+    elif workflow == 0:
+        command.append("--with-solvers")
+    elif workflow == 1:
+        command.append("--separate-solvers")
+    elif workflow == 3:
+        command[0] = "context"
+    for provider in provider_names[provider_choice]:
+        command.extend(["--provider", provider])
+    print("Starting the selected workflow.")
+    return main(command)
+
+
+def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
-    top_description = """Review a CTF service through visible Qwen or Z.ai chats.
+    top_description = """Choose a CTF service chat workflow.
 
-Requires Python 3.10+ and a Chromium-based browser (Chromium, Chrome, Brave, Edge, Vivaldi, or Opera) available in PATH. No Python packages are required. A graphical desktop is needed because chats and any verification prompts open visibly. PDF files are optional; install poppler-utils to extract them."""
-    top_epilog = """EXAMPLES BY FLOW
-  Open empty provider chats:
-    python3 manual_chat_contexts.py open --task demo --provider qwen
+Run `python3 manual_chat_contexts.py tui` for a guided menu. Requires Python 3.10+, a graphical desktop, and a Chromium-based browser. No Python packages are required."""
+    top_epilog = """Choose one workflow
 
-  Fill a chat with a prompt and one or more files (add --submit to send it):
-    python3 manual_chat_contexts.py ask --task demo --provider qwen --prompt "Review this handler" --file ./task/handler.py
+  Audit, then get solvers and patches in the same chat
+    python3 manual_chat_contexts.py audit --folder ./task --provider qwen --with-solvers
 
-  Preview collected files and prompt chunks without opening a browser:
-    python3 manual_chat_contexts.py prepare --folder ./task
+  Audit, then open one solver and patch chat per finding
+    python3 manual_chat_contexts.py audit --folder ./task --provider qwen --separate-solvers
 
-  Audit the whole service (default mode); request machine-readable findings:
-    python3 manual_chat_contexts.py audit --folder ./task --provider qwen --structured-findings
+  Deep file-by-file audit with full service context and solutions in each chat
+    python3 manual_chat_contexts.py audit --folder ./task --provider qwen --granulize 5
+    5 means five reviewed files per browser session. All those sessions run in parallel.
 
-  Opt into per-file audit sessions; each session has full source context:
-    python3 manual_chat_contexts.py audit --folder ./task --provider qwen --granulize=5 --parallel-sessions=2
-
-  Prefill a chat for free discussion about the service:
+  Load service context and leave the chat ready for questions
     python3 manual_chat_contexts.py context --folder ./task --provider qwen
 
-  Continue an audit chat to request solver and patch material:
-    python3 manual_chat_contexts.py continue --task demo --provider qwen --attach-profile PROFILE/qwen-1
-  Add --scope solver or --scope patch for one deliverable, or --findings-json findings.json.
+  Audit only and leave the completed audit chat open for discussion
+    python3 manual_chat_contexts.py audit --folder ./task --provider qwen
 
-  Create one full-context solver/patch chat per finding:
-    python3 manual_chat_contexts.py solve --folder ./task --provider qwen --findings-json findings.json
-
-WORKFLOW NOTES
-  Start with audit; solver and patch work is requested separately with continue or solve.
-  For commands that accept --provider, omission selects both Qwen and Z.ai; continue requires one provider.
-  Finished browser windows stay open. Close them when you are done. Use 'COMMAND --help' for details.
-  Default UI models are Qwen 3.8 Max and GLM 5.3 Flash. Profiles use the platform cache directory;
-  set --profile-root to choose another location. On Ubuntu, PDF extraction is enabled by:
-    sudo apt install poppler-utils"""
+The default provider is Qwen. Use `--provider zai` for Z.ai. Use `--help` after a workflow name for its options."""
     parser = argparse.ArgumentParser(
         description=top_description,
         epilog=top_epilog,
         formatter_class=CLIHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{tui,audit,context}",
+    )
+
+    subparsers.add_parser(
+        "tui",
+        help="choose one of five workflows from an interactive menu",
+        description="Choose an audit or context workflow, then enter the task folder and provider.",
+        formatter_class=CLIHelpFormatter,
+    )
 
     open_parser = subparsers.add_parser(
         "open",
-        help="open empty provider chats",
+        help=argparse.SUPPRESS,
         description="Open fresh visible Chromium chats without filling or sending a prompt.",
         epilog="Example:\n  python3 manual_chat_contexts.py open --task AML-1 --provider qwen",
         formatter_class=CLIHelpFormatter,
@@ -2243,7 +2431,7 @@ WORKFLOW NOTES
 
     ask_parser = subparsers.add_parser(
         "ask",
-        help="fill a chat with your prompt and selected files",
+        help=argparse.SUPPRESS,
         description="Build one prompt from your text and selected UTF-8 files, then fill a fresh chat composer.",
         epilog="By default the prompt is left in the composer for review. Add --submit to send it.\n\nExample:\n  python3 manual_chat_contexts.py ask --task AML-1 --provider qwen --prompt PROMPT --file ./task/handler.go",
         formatter_class=CLIHelpFormatter,
@@ -2258,62 +2446,63 @@ WORKFLOW NOTES
 
     for command, help_text in (
         ("prepare", "preview source collection and audit prompts (no browser)"),
-        ("audit", "audit a service in fresh chat contexts"),
+        ("audit", "audit a service and optionally generate solvers and patches"),
         ("context", "load source into a chat for free discussion"),
     ):
         descriptions = {
             "prepare": "Collect eligible source files and write the exact numbered prompts without opening a browser.",
-            "audit": "Send a whole-service source review to fresh provider chats. Granular file review is opt-in.",
+            "audit": "Audit a service, then keep the browser chat open. Choose whether to generate solvers and patches in that chat or in separate chats.",
             "context": "Load the service source into a fresh chat and leave it open for your own questions; no audit report is requested.",
         }
         epilogs = {
             "prepare": "Examples:\n  python3 manual_chat_contexts.py prepare --folder ./task\n  python3 manual_chat_contexts.py prepare --folder ./task --granulize=5\n\nInspect the numbered prompt files to confirm which source files were included. --benchmark writes a local checklist when the task matches a known family; it is not sent to the chat.",
-            "audit": "Examples:\n  python3 manual_chat_contexts.py audit --folder ./task --provider qwen --structured-findings\n  python3 manual_chat_contexts.py audit --folder ./task --provider qwen --granulize=5 --parallel-sessions=1\n\nWithout --granulize, this is one whole-service conversation per selected provider and replica. Each granular session loads the complete source context, then reviews its assigned files one by one. Granular mode already returns per-file JSON and cannot be combined with --structured-findings. Finished browser windows remain open; parallel-sessions limits concurrently driven session plans, not accumulated open windows.",
+            "audit": "Examples:\n  1. Audit only, then chat in the same window\n     python3 manual_chat_contexts.py audit --folder ./task --provider qwen\n\n  2. Audit and get solvers/patches in that same chat\n     python3 manual_chat_contexts.py audit --folder ./task --provider qwen --with-solvers\n\n  3. Audit, then one new solver/patch chat per finding\n     python3 manual_chat_contexts.py audit --folder ./task --provider qwen --separate-solvers\n\n  4. Deep audit, one file per session, with full source context and solutions\n     python3 manual_chat_contexts.py audit --folder ./task --provider qwen --granulize 1\n     Change 1 to 5 to review five files in each session. The number of parallel sessions follows automatically. Each granular chat produces its solvers and patches after its file reviews.",
             "context": "Example:\n  python3 manual_chat_contexts.py context --folder ./task --provider qwen\n\nThe source is sent to the selected provider. Complete any verification in the visible browser if requested; the chat remains open after CONTEXT READY.",
         }
         job_parser = subparsers.add_parser(
             command,
-            help=help_text,
+            help=help_text if command in {"audit", "context"} else argparse.SUPPRESS,
             description=descriptions[command],
             epilog=epilogs[command],
             formatter_class=CLIHelpFormatter,
         )
         job_parser.add_argument("--folder", type=Path, required=True, help="one CTF service/task folder")
-        job_parser.add_argument("--out", type=Path, help="directory for generated prompt files")
+        job_parser.add_argument("--out", type=Path, help="directory for generated prompt files" if command == "prepare" else argparse.SUPPRESS)
         job_parser.add_argument(
             "--message-chars",
             "--max-chars",
             dest="message_chars",
             type=int,
             default=QWEN_MAX_MESSAGE_CHARS,
-            help="maximum characters in each consecutive chat message (default: 131072)",
+            help="maximum characters in each consecutive chat message (default: 131072)" if command == "prepare" else argparse.SUPPRESS,
         )
-        job_parser.add_argument("--max-file-bytes", type=int, default=250_000, help="skip larger individual files")
-        job_parser.add_argument("--benchmark", action="store_true", help="write a local ground-truth checklist when a known service matches; never sent to the chat")
-        job_parser.add_argument("--review-focus", help="extra competition/task context included in the final review turn")
+        job_parser.add_argument("--max-file-bytes", type=int, default=250_000, help="skip larger individual files" if command == "prepare" else argparse.SUPPRESS)
+        job_parser.add_argument("--benchmark", action="store_true", help="write a local ground-truth checklist when a known service matches; never sent to the chat" if command == "prepare" else argparse.SUPPRESS)
+        job_parser.add_argument("--review-focus", help="extra competition/task context included in the final review turn" if command == "prepare" else argparse.SUPPRESS)
         if command in {"prepare", "audit"}:
-            job_parser.add_argument("--granulize", type=int, metavar="N", help="opt in: each independent chat loads full context, then reviews N files one by one (default: off)")
-            job_parser.add_argument("--structured-findings", action="store_true", help="ask the same whole-service audit chat for confirmed findings JSON after its report")
-        if command in {"audit", "context"}:
-            job_parser.add_argument("--provider", choices=tuple(PROVIDERS), action="append", help="repeat to use both sites; default: both")
-            job_parser.add_argument("--replicas", type=int, default=1, help="independent browser contexts per provider")
-            if command == "audit":
-                job_parser.add_argument("--parallel-sessions", type=int, default=2, help="granular session plans driven concurrently; completed browser windows remain open")
-            job_parser.add_argument("--browser", help="Chromium-based browser executable; auto-detected by default")
-            job_parser.add_argument("--profile-root", type=Path, default=default_profile_root(), help="directory for isolated browser profiles (default: platform cache directory)")
-            job_parser.add_argument("--captcha-wait", type=int, default=180, help="seconds to wait for a composer, allowing manual CAPTCHA solving")
-            job_parser.add_argument("--wait-after-submit", type=int, default=600, help="maximum seconds to wait for visible completion controls")
-            add_model_options(job_parser)
+            job_parser.add_argument("--granulize", "--files-per-session", type=int, metavar="N", help="review N files per full-context chat; run all groups in parallel and request solutions in each chat (default: off)")
+            job_parser.add_argument("--structured-findings", action="store_true", help=argparse.SUPPRESS if command == "audit" else "ask for machine-readable findings after the audit")
         if command == "audit":
-            job_parser.add_argument("--attach-profile", type=Path, help="reuse one already-open Chromium profile with a DevTools endpoint")
-            job_parser.add_argument("--attach-port", type=int, help="local DevTools port for an attached profile without DevToolsActivePort")
-            job_parser.add_argument("--resume-after", type=int, default=0, help="wait for the already-submitted Nth message, then continue at N+1 (requires --attach-profile)")
-            job_parser.add_argument("--resume-from", type=Path, help="directory containing the original numbered prompts to resume (preserves receipt markers)")
+            solution_mode = job_parser.add_mutually_exclusive_group()
+            solution_mode.add_argument("--with-solvers", action="store_true", help="after the audit, request solvers and patches in the same chat")
+            solution_mode.add_argument("--separate-solvers", action="store_true", help="after the audit, open one new solver/patch chat per finding")
+        if command in {"audit", "context"}:
+            job_parser.add_argument("--provider", choices=tuple(PROVIDERS), action="append", help="choose qwen or zai; repeat to use both (default: qwen)")
+            job_parser.set_defaults(replicas=1)
+            job_parser.add_argument("--browser", help="Chromium-based browser executable; auto-detected by default")
+            job_parser.add_argument("--profile-root", type=Path, default=default_profile_root(), help="directory for isolated browser profiles (default: platform cache directory)" if command == "prepare" else argparse.SUPPRESS)
+            job_parser.add_argument("--captcha-wait", type=int, default=180, help="seconds to wait for a composer, allowing manual CAPTCHA solving" if command == "prepare" else argparse.SUPPRESS)
+            job_parser.add_argument("--wait-after-submit", type=int, default=600, help="maximum seconds to wait for visible completion controls" if command == "prepare" else argparse.SUPPRESS)
+        if command == "audit":
+            job_parser.add_argument("--attach-profile", type=Path, help=argparse.SUPPRESS, default=None)
+            job_parser.add_argument("--attach-port", type=int, help=argparse.SUPPRESS)
+            job_parser.add_argument("--resume-after", type=int, default=0, help=argparse.SUPPRESS)
+            job_parser.add_argument("--resume-from", type=Path, help=argparse.SUPPRESS)
         job_parser.set_defaults(handler=run_folder_command)
 
     continue_parser = subparsers.add_parser(
         "continue",
-        help="request solver/patch work in an existing audit chat",
+        help=argparse.SUPPRESS,
         description="Attach to one still-open provider chat and continue it with a solver/patch follow-up.",
         epilog="Example (use the provider profile printed by audit):\n  python3 manual_chat_contexts.py continue --task AML-1 --provider qwen --attach-profile PROFILE/qwen-1\n\nKeep the original browser window open. Omit --findings-json to use findings already discussed in that conversation; use --scope solver or --scope patch to request just one deliverable.",
         formatter_class=CLIHelpFormatter,
@@ -2335,9 +2524,9 @@ WORKFLOW NOTES
 
     solve_parser = subparsers.add_parser(
         "solve",
-        help="create one full-context solver/patch chat per finding",
-        description="Validate supplied findings against the task source, then open a fresh full-context chat for each finding.",
-        epilog="Examples:\n  python3 manual_chat_contexts.py solve --folder ./task --provider qwen --findings-json findings.json\n  python3 manual_chat_contexts.py solve --folder ./task --provider qwen\n\nWithout --findings-json, paste a JSON object containing a non-empty 'findings' array into the terminal and press Ctrl-D on an empty line. Each finding asks for a CTF solver and a minimal patch. Window count = findings × providers × replicas; finished windows stay open.",
+        help=argparse.SUPPRESS,
+        description="Use existing findings to open one new solver and patch chat per finding.",
+        epilog="Example:\n  python3 manual_chat_contexts.py solve --folder ./task --provider qwen --findings-json findings.json\n\nEach finding opens one chat per selected provider. The default provider is Qwen. Without --findings-json, paste the findings JSON into the terminal and press Ctrl-D when finished.",
         formatter_class=CLIHelpFormatter,
     )
     solve_parser.add_argument("--folder", type=Path, required=True, help="one CTF service/task folder")
@@ -2345,9 +2534,7 @@ WORKFLOW NOTES
     solve_parser.add_argument("--out", type=Path, help="directory for generated context prompts and responses")
     solve_parser.add_argument("--message-chars", type=int, default=QWEN_MAX_MESSAGE_CHARS, help="maximum characters in each chat message")
     solve_parser.add_argument("--max-file-bytes", type=int, default=250_000, help="skip individual source files larger than this")
-    solve_parser.add_argument("--provider", choices=tuple(PROVIDERS), action="append", help="repeat to use both sites; default: both")
-    solve_parser.add_argument("--replicas", type=int, default=1, help="independent contexts per provider for each finding")
-    solve_parser.add_argument("--parallel-sessions", type=int, default=2, help="finding session plans driven concurrently; finished windows remain open")
+    solve_parser.add_argument("--provider", choices=tuple(PROVIDERS), action="append", help="choose qwen or zai; repeat to use both (default: qwen)")
     solve_parser.add_argument("--browser", help="Chromium-based browser executable; auto-detected by default")
     solve_parser.add_argument("--profile-root", type=Path, default=default_profile_root(), help="directory for isolated browser profiles (default: platform cache directory)")
     solve_parser.add_argument("--captcha-wait", type=int, default=180, help="seconds to wait for a ready chat composer")
@@ -2355,22 +2542,29 @@ WORKFLOW NOTES
     add_model_options(solve_parser)
     solve_parser.set_defaults(handler=run_solve_command)
 
-    args = parser.parse_args()
+    hidden_commands = {"open", "ask", "prepare", "continue", "solve"}
+    subparsers._choices_actions = [
+        action for action in subparsers._choices_actions if action.dest not in hidden_commands
+    ]
+
+    args = parser.parse_args(argv)
+    if args.command == "tui":
+        return run_tui()
     if args.command == "ask":
         if not args.provider:
-            args.provider = list(PROVIDERS)
+            args.provider = ["qwen"]
         if args.max_chars < 1:
             parser.error("--max-chars must be positive")
         material = prepare_material(args.prompt, args.file, args.max_chars)
         return launch(args, material, submit=args.submit)
     if args.command == "open":
         if not args.provider:
-            args.provider = list(PROVIDERS)
+            args.provider = ["qwen"]
         if args.replicas < 1:
             parser.error("--replicas must be positive")
         return launch(args, None)
     if args.command in {"audit", "context", "solve"} and not args.provider:
-        args.provider = list(PROVIDERS)
+        args.provider = ["qwen"]
     if args.command == "continue" and len(args.provider) != 1:
         parser.error("continue accepts exactly one --provider")
     return args.handler(args)
