@@ -1,0 +1,44 @@
+diff --git a/lib/voltax/presenters/public_feed_event_presenter.rb b/lib/voltax/presenters/public_feed_event_presenter.rb
+--- a/lib/voltax/presenters/public_feed_event_presenter.rb
++++ b/lib/voltax/presenters/public_feed_event_presenter.rb
+@@ -67,20 +67,16 @@
+         {}
+       end
+ 
+       def normalize_event_attributes(rendered, value)
+         return rendered unless value.is_a?(Hash)
+ 
+-        DTOs::ActivationContextDTO.expanded_attributes(value).each do |key, context_value|
++        DTOs::ActivationContextDTO.public_attributes(value).each do |key, context_value|
+           rendered[key.to_sym] = context_value
+         end
+         rendered
+-      end
+-
+-      def deep_event_attributes(value, prefix: nil)
+-        DTOs::ActivationContextDTO.deep_event_attributes(value, prefix: prefix)
+       end
+ 
+       def parsed_payload(payload_json)
+         payload_json.is_a?(Hash) ? payload_json : JSON.parse(payload_json.to_s)
+       end
+     end
+diff --git a/lib/voltax/services/conditional_trigger_service.rb b/lib/voltax/services/conditional_trigger_service.rb
+--- a/lib/voltax/services/conditional_trigger_service.rb
++++ b/lib/voltax/services/conditional_trigger_service.rb
+@@ -140,14 +140,13 @@
+ 
+       def activation_context_for(order)
+         DTOs::ActivationContextDTO.render(
+           signal: {
+             kind: order[:trigger_type],
+             threshold: Money.format(order[:trigger_price]),
+-            routing_profile: routing_profile_for(order),
+-            signal_context: order[:signal_context]
++            routing_profile: routing_profile_for(order)
+           }
+         )
+       end
+ 
+       def routing_profile_for(order)
+         [order[:order_type], order[:side], "central-book"].compact.join(":")

@@ -1,0 +1,25 @@
+diff --git a/lib/voltax/services/rfq_service.rb b/lib/voltax/services/rfq_service.rb
+--- a/lib/voltax/services/rfq_service.rb
++++ b/lib/voltax/services/rfq_service.rb
+@@ -339,8 +339,7 @@ class QuoteWorkupAssembler
+ 
+         def packet
+           base_row.merge(
+-            pricing_details: pricing_details,
+-            workup_terms: term_sheet.fetch(:terms)
++            pricing_details: pricing_details
+           )
+         end
+ 
+@@ -360,11 +359,6 @@ class QuoteWorkupAssembler
+           }
+         end
+ 
+-        def term_sheet
+-          {
+-            terms: rfq[:delivery_terms]
+-          }
+-        end
+       end
+     end
+   end

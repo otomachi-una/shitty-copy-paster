@@ -1,0 +1,4 @@
+Review turn 60eb6a093944
+Run an independent attack-surface pass using the service map as an index. For every HTTP route and other reachable entry point, trace attacker-controlled input through authentication, object/tenant/role checks, business logic, repository calls, and each returned field or side effect. Check the applicable vulnerability classes from the final review request. For each candidate, state the route, resource, relevant gate, and exact source evidence. Explicitly mark entry points reviewed without a candidate. Do not write fixes or solvers; keep the report compact and finish with the receipt line.
+
+End with this exact receipt line on its own: RECEIVED-bf9d1c01f62c

@@ -1,0 +1,32 @@
+diff --git a/internal/httpapi/dedup_merge_preview.go b/internal/httpapi/dedup_merge_preview.go
+--- a/internal/httpapi/dedup_merge_preview.go
++++ b/internal/httpapi/dedup_merge_preview.go
+@@ -20,26 +20,10 @@ func caseMatchPreviewAvailable() bool {
+ 	return true
+ }
+ 
+-func (s *Server) caseDuplicateMergePreviewResponse(ctx context.Context, ownerUserID int64, sourceCaseID int64, candidate casework.DuplicateCandidate) (any, error) {
++func (s *Server) caseDuplicateMergePreviewResponse(_ context.Context, _ int64, sourceCaseID int64, candidate casework.DuplicateCandidate) (any, error) {
+ 	view := duplicatePreviewView(candidate)
+ 	evidence := casework.PublicCaseSimilarityEvidence(candidate)
+-	if resolver, ok := s.cases.(casework.MatchEvidenceResolver); ok {
+-		resolved, err := resolver.ResolveMatchEvidence(ctx, casework.MatchEvidenceRequest{
+-			OwnerUserID:     ownerUserID,
+-			SourceCaseID:    sourceCaseID,
+-			CandidateCaseID: candidate.CaseID,
+-		})
+-		if err != nil {
+-			return nil, err
+-		}
+-		evidence = append(evidence, resolved...)
+-	}
+-	explanation := casework.NewMatchExplanationBuilder(
+-		casework.MatchEvidenceSourceReviewContext,
+-		casework.MatchEvidenceSourceCounterparty,
+-		casework.MatchEvidenceSourceRiskTags,
+-		casework.MatchEvidenceSourcePublicTransaction,
+-	).Build(evidence, view.MatchExplanation)
++	explanation := casework.NewMatchExplanationBuilder(casework.PublicMatchEvidenceSources()...).Build(evidence, view.MatchExplanation)
+ 
+ 	response := caseMatchDuplicateMergePreviewResponse{
+ 		SourceCaseID: sourceCaseID,

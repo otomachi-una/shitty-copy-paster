@@ -1,0 +1,73 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+require "securerandom"
+
+ROOT = File.expand_path("..", __dir__)
+PYTHON = ENV.fetch("PYTHON", "python")
+SECRET = ENV.fetch("VOLTAX_CHECKER_SECRET", "")
+POLICIES = %w[competition strict-fix-validation].freeze
+
+def usage
+  puts "usage: ruby bin/validate-checker --policy <competition|strict-fix-validation> SERVICE_URL"
+  puts "Runs checker check, havoc, and PUT/GET for places 1 through 4."
+end
+
+if ARGV == ["--help"] || ARGV == ["-h"]
+  usage
+  exit 0
+end
+
+policy = nil
+host = nil
+until ARGV.empty?
+  arg = ARGV.shift
+  case arg
+  when "--policy"
+    policy = ARGV.shift
+  when /\A--policy=(.+)\z/
+    policy = Regexp.last_match(1)
+  else
+    abort "unexpected argument #{arg}" if host
+    host = arg
+  end
+end
+abort "--policy is required" if policy.to_s.empty?
+abort "invalid --policy #{policy}" unless POLICIES.include?(policy)
+abort "SERVICE_URL is required" if host.to_s.empty?
+abort "VOLTAX_CHECKER_SECRET is required" if SECRET.empty?
+
+def run_checker(policy, *args, sensitive: [])
+  stdout, stderr, status = Open3.capture3(
+    {
+      "VOLTAX_CHECKER_SECRET" => SECRET,
+      "VOLTAX_CHECKER_POLICY" => policy,
+      "PYTHONDONTWRITEBYTECODE" => "1"
+    },
+    PYTHON, "checkers/voltax/checker.py", *args,
+    chdir: ROOT
+  )
+  unless status.exitstatus == 101
+    output = "#{stdout}\n#{stderr}".gsub(SECRET, "[checker-credential]")
+    sensitive.each { |value| output = output.gsub(value.to_s, "[redacted]") }
+    warn output[0, 4000]
+    abort "checker #{args.first} failed"
+  end
+  [stdout.strip, stderr.strip]
+end
+
+run_checker(policy, "check", host)
+run_checker(policy, "havoc", host)
+(1..4).each do |place|
+  value = "ADMIN-CHECK-PLACE#{place}-#{SecureRandom.hex(8)}"
+  put_stdout, put_stderr = run_checker(policy, "PUT", host, "incoming-#{SecureRandom.hex(8)}", value, place.to_s, sensitive: [value])
+  public = JSON.parse(put_stdout)
+  abort "checker PUT stdout must be a public JSON object" unless public.is_a?(Hash)
+  abort "checker PUT stdout must not contain flag_id" if public.key?("flag_id")
+  private_flag_id = put_stderr
+  abort "checker PUT stderr private flag_id missing" if private_flag_id.empty?
+  run_checker(policy, "GET", host, private_flag_id, value, place.to_s, sensitive: [private_flag_id, value])
+end
+puts "admin checker validation passed"

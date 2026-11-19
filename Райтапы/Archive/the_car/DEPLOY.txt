@@ -1,0 +1,166 @@
+the_car — ДЕПЛОЙ: ЧТО КУДА КЛАСТЬ
+================================
+
+Три роли, три машины:
+  ЖЮРИ      хост ForcAD, 192.168.1.8 — чекер и приватные ключи
+  КОМАНДА   свой вулнбокс, 192.168.1.(8+NN) — уязвимый сервис
+  АВТОР     эта папка целиком, игрокам не отдаётся
+
+Что лежит в репозитории
+-----------------------
+  src/                уязвимая версия — ЭТО раздаётся командам
+  src_fix/            патченная версия — только у жюри, образец патча
+  checker/            чекер ForcAD + генераторы ключей — только у жюри
+  sploit/             эталонные сплойты, 6 штук — только у жюри
+  deploy/keys/env/    20 публичных team-NN.env — раздаются по одному
+  deploy/keys/private/ приватные подписные ключи — ТОЛЬКО жюри
+  deploy/smoke_checker.py  самопроверка таска
+  src/service.yaml, forcad_config.yml  описание таска для ForcAD
+  README.txt          описание сервиса и уязвимости
+  DEPLOY.txt          этот файл
+
+
+1. ЖЮРИ: ХОСТ ForcAD (192.168.1.8)
+==================================
+
+1.1 Чекер
+Везти только три файла. generate_keys.py / generate_team_keys.py в контейнер
+воркера НЕ нужны — ключи уже сгенерированы, они остаются у тебя локально.
+
+  scp checker/checker.py checker/checker_protocol.py deploy/smoke_checker.py \
+      forcad@192.168.1.8:/tmp/
+
+  ssh forcad@192.168.1.8
+  mkdir -p /opt/forcad/checkers/the_car
+  cp /tmp/checker.py /tmp/checker_protocol.py /tmp/smoke_checker.py \
+     /opt/forcad/checkers/the_car/
+  # ForcAD запускает чекер напрямую -> строго LF, иначе rc 127:
+  sed -i 's/\r$//' /opt/forcad/checkers/the_car/*.py
+  chmod +x /opt/forcad/checkers/the_car/checker.py
+
+  Зависимости чекера. Файл вшивается в образ воркера на сборке
+  (Dockerfile.carhack: COPY checkers/requirements.txt + pip install),
+  поэтому его правка требует ПЕРЕСБОРКИ, а не restart:
+  cat > /opt/forcad/checkers/requirements.txt <<'EOF'
+  checklib
+  cryptography==42.0.8
+  EOF
+
+  Итог на диске жюри:
+    /opt/forcad/checkers/the_car/checker.py           (chmod +x, LF)
+    /opt/forcad/checkers/the_car/checker_protocol.py
+    /opt/forcad/checkers/the_car/smoke_checker.py
+    /opt/forcad/checkers/requirements.txt
+
+1.2 Приватные ключи
+  scp deploy/keys/private/checker-keys.json forcad@192.168.1.8:/tmp/
+
+  sudo install -d -m 700 -o forcad -g forcad /etc/forcad/carhack
+  install -m 600 /tmp/checker-keys.json /etc/forcad/carhack/checker-keys.json
+  rm /tmp/checker-keys.json
+
+  Воркер уже смонтирован на /etc/forcad/carhack (ro) и читает
+  CHECKER_KEYS_FILE=/run/secrets/carhack/checker-keys.json.
+  Если монтирования нет — см. deploy/the_car.override.yml.example.
+
+1.3 Описание таска в /opt/forcad/config.yml
+  tasks:
+    - name: the_car
+      checker: the_car/checker.py
+      checker_type: pfr
+      checker_timeout: 20
+      places: 6
+      puts: 6            # не 1: ForcAD выбирает место случайно из 6
+      gets: 6
+      default_score: 2500
+  teams:                 # ровно те же 20 хостов, что в deploy/keys/teams.csv
+    - { name: "Team 01", ip: 192.168.1.9 }
+    ...
+    - { name: "Team 20", ip: 192.168.1.28 }
+
+  Хост без записи в checker-keys.json даёт CHECKER_ERROR каждый раунд.
+
+1.4 Применить и проверить
+  cd /opt/forcad
+  docker compose up -d --build celery     # --build обязателен, если менял
+                                          # checkers/requirements.txt
+  docker compose restart ticker
+
+  Каталог /checkers смонтирован как bind, поэтому правка самого чекера
+  подхватывается обычным restart celery без пересборки.
+
+  docker exec forcad-celery-1 \
+    /checkers/the_car/smoke_checker.py 192.168.1.9 \
+    --checker /checkers/the_car/checker.py
+  Ожидается 14 строк со 101 и ALL_OK. CHECKER_KEYS_FILE воркеру уже задан
+  в docker-compose.yml, отдельно передавать не нужно.
+
+
+2. КОМАНДЕ: ЧТО ОТДАТЬ
+======================
+Отдать ровно это:
+  src/                          уязвимый сервис
+  deploy/keys/env/team-NN.env   ЕЁ один файл, остальные 19 не отдавать
+  README.txt                    по желанию, описание и эндпоинты
+
+НЕ отдавать: src_fix/, checker/, sploit/, deploy/keys/private/, deploy/keys/teams.csv,
+остальные team-NN.env.
+
+Команда у себя:
+  cp team-05.env src/.env
+  echo "TELE_KEY=$(openssl rand -hex 32)" >> src/.env
+  cd src && docker compose up -d --build
+
+Итог на вулнбоксе:
+  <путь>/src/.env            TEAM_ID, CHECKER_PUBKEY, TELE_KEY
+  <путь>/src/...             исходники, монтируются в образ
+
+Проверка, что бокс поднялся:
+  curl -s localhost:8080/api/health     -> {"status":"ok"}
+  curl -s localhost:8888/api/health     -> {"status":"ok","service":"autopilot"}
+  nc localhost 31337                    -> CarHack diagnostic ready
+Открыты должны быть 8080, 8888, 31337.
+
+
+3. ПОРЯДОК НА СТАРТЕ
+====================
+  1. Залить чекер и ключи на ForcAD (шаги 1.1-1.2)
+  2. Прописать таск и 20 команд в config.yml (1.3)
+  3. Раздать командам src/ и по одному team-NN.env (2)
+  4. Дождаться, пока все боксы ответят на /api/health
+  5. smoke_checker по 2-3 боксам (1.4)
+  6. restart celery ticker, проверить скорборд: статус 101, не 110
+
+
+4. ЕСЛИ АДРЕСА КОМАНД ДРУГИЕ
+============================
+Перегенерировать ключи НЕ нужно — сервис проверяет только TEAM_ID и
+CHECKER_PUBKEY. Достаточно переименовать хост в JSON и поправить config.yml:
+
+  python3 - <<'EOF'
+  import json
+  p = "/etc/forcad/carhack/checker-keys.json"
+  d = json.load(open(p))
+  d["10.60.5.9"] = d.pop("192.168.1.9")
+  json.dump(d, open(p, "w"), indent=2, sort_keys=True)
+  EOF
+  cd /opt/forcad && docker compose restart celery
+
+Если команд станет больше 20 — checker/generate_team_keys.py, подробности
+в deploy/keys/README.txt.
+
+
+5. ГРАБЛИ
+=========
+* checker.py с CRLF -> rc 127, таск не работает. Всегда sed -i 's/\r$//'.
+* Сборка образа тянет three.js с unpkg.com. Если на вулнбоксах нет
+  интернета — соберите образ заранее и раздайте docker save / registry,
+  иначе команда не пересоберёт сервис после патча.
+* Не держи вулнбоксы на том же хосте, что ForcAD. На этом стенде 2 ядра:
+  две сборки сервиса рядом с 12 контейнерами ForcAD разгоняют load average
+  до 7-10, и CHECK начинает отдавать ложный DOWN примерно в 1 случае из 20.
+  По одной цели за раз на том же хосте — 0 отказов из 40.
+* checker-keys.json — 20 приватных ключей. Утечка = любая команда ходит
+  как чекер на все боксы. Только 600, только на хосте жюри.
+* У ForcAD на этом стенде postgres/redis/rabbitmq слушают 0.0.0.0 с
+  admin/admin. Перед игрой закрыть их от игровой сети или сменить пароли.

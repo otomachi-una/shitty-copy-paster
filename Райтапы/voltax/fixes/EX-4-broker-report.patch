@@ -1,0 +1,90 @@
+diff --git a/lib/voltax/services/broker_report_service.rb b/lib/voltax/services/broker_report_service.rb
+--- a/lib/voltax/services/broker_report_service.rb
++++ b/lib/voltax/services/broker_report_service.rb
+@@ -1,7 +1,6 @@
+ require "time"
+ require "sequel"
+ require_relative "../account_profiles"
+ require_relative "../money"
+-require_relative "../repositories/trade_receipt_repository"
+ 
+ module VoltaX
+@@ -17,12 +16,11 @@
+       def trade_rows(user:, month: nil, campaign_id: nil)
+         validate_broker!(user)
+         dataset = base_report_dataset(broker_user_id: user[:id])
+         dataset = dataset.where(Sequel[:campaigns][:id] => parse_id(campaign_id)) if campaign_id
+         dataset = apply_month_filter(dataset, month) if month
+ 
+-        rows = dataset.order(Sequel[:campaigns][:id], Sequel[:trades][:created_at], Sequel[:trades][:public_sequence], Sequel[:receipts][:id])
++        dataset.order(Sequel[:campaigns][:id], Sequel[:trades][:created_at], Sequel[:trades][:public_sequence], Sequel[:receipts][:id])
+           .all
+-        enrichment_snapshot = execution_enrichment_snapshot(rows)
+-        rows.map { |row| report_row_for(row, enrichment_snapshot: enrichment_snapshot) }
++          .map { |row| report_row_for(row) }
+       rescue ArgumentError
+         raise InvalidRequest
+@@ -84,7 +81,7 @@
+         dataset.where { Sequel[:trades][:created_at] >= start_time }
+           .where { Sequel[:trades][:created_at] < end_time }
+       end
+ 
+-      def report_row_for(row, enrichment_snapshot:)
++      def report_row_for(row)
+         origin = origin_for(row[:client_order_id])
+         notional_volume = Money.coerce_decimal(row[:notional_volume])
+@@ -111,54 +108,15 @@
+           liquidity_band: liquidity_band_for(notional_volume),
+           venue_code: venue_code_for(row[:market_symbol]),
+           fee_tier: fee_tier_for(row),
+           rebate_hint: rebate_hint_for(row),
+           routing_label: routing_label_for(origin)
+         }
+-        if origin == "orderbook"
+-          context = allocation_enrichment_for(row, enrichment_snapshot: enrichment_snapshot)
+-          report[:booking_marker] = context[:booking_marker] if context&.key?(:booking_marker)
+-        end
+         report
+       end
+ 
+-      def allocation_enrichment_for(row, enrichment_snapshot:)
+-        enrichment_snapshot[row[:trade_id]]
+-      end
+-
+-      def execution_enrichment_snapshot(rows)
+-        trade_ids = rows.map { |row| row[:trade_id] }.uniq
+-        return {} if trade_ids.empty?
+-
+-        database[:trade_receipts]
+-          .where(trade_id: trade_ids)
+-          .order(:id)
+-          .all
+-          .group_by { |receipt| receipt[:trade_id] }
+-          .transform_values { |receipt_rows| venue_booking_context_for(receipt_rows) }
+-      end
+-
+-      def venue_booking_context_for(receipt_rows)
+-        booking_marker = receipt_rows.map { |receipt| receipt[booking_marker_column] }
+-          .compact
+-          .find { |value| !value.to_s.empty? }
+-        primary = receipt_rows.first
+-        return {} unless primary
+-
+-        {
+-          side: primary[:side],
+-          liquidity_role: primary[:liquidity_role],
+-          settlement_status: primary[:settlement_status],
+-          booking_marker: booking_marker
+-        }.compact
+-      end
+-
+-      def booking_marker_column
+-        Repositories::TradeReceiptRepository::BOOKING_MARKER_COLUMN
+-      end
+-
+       def liquidity_band_for(notional_volume)
+         return "micro" if notional_volume < Money.coerce_decimal("10")
+         return "block" if notional_volume >= Money.coerce_decimal("1000")
+ 
+         "standard"
+       end

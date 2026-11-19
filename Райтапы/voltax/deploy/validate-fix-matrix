@@ -1,0 +1,660 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "socket"
+require "tmpdir"
+require "time"
+require "uri"
+
+module Release
+  module ValidateFixMatrix
+    SCRIPT_DIR = File.expand_path(__dir__)
+    ROOT = File.basename(SCRIPT_DIR) == "bin" ? File.expand_path("..", SCRIPT_DIR) : File.expand_path("../..", SCRIPT_DIR)
+    DEFAULT_PARTICIPANT_TREE = File.expand_path(File.join(ROOT, "..", "team", "voltax-exchange-team"))
+    INTERNAL_PARTICIPANT_TREE = File.expand_path(File.join(ROOT, "dist", "team", "voltax-exchange-team"))
+    DEFAULT_EVIDENCE_PATH =
+      if File.basename(SCRIPT_DIR) == "bin"
+        File.join(ROOT, "evidence", "fix_matrix_validation_evidence.json")
+      else
+        File.join(ROOT, "docs", "release", "fix_matrix_validation_evidence.json")
+      end
+
+    EX_ROWS = {
+      "EX-1" => {
+        place: 1,
+        patch: "fixes/voltax/participant/EX-1-client-order-id-collision.patch",
+        sploit: "sploits/voltax/ex_client_order_id_collision.py"
+      },
+      "EX-2" => {
+        place: 3,
+        patch: "fixes/voltax/participant/EX-2-rfq-preview.patch",
+        sploit: "sploits/voltax/ex_rfq_preview.py"
+      },
+      "EX-3" => {
+        place: 2,
+        patch: "fixes/voltax/participant/EX-3-counterparty-receipt.patch",
+        sploit: "sploits/voltax/ex_counterparty_receipt.py"
+      },
+      "EX-4" => {
+        place: nil,
+        patch: "fixes/voltax/participant/EX-4-broker-report.patch",
+        sploit: "sploits/voltax/ex_broker_report.py"
+      },
+      "EX-5" => {
+        place: 4,
+        patch: "fixes/voltax/participant/EX-5-conditional-feed.patch",
+        sploit: "sploits/voltax/ex_conditional_feed.py"
+      }
+    }.freeze
+
+    PYTHON_DIRECTORIES = %w[checkers/voltax sploits/voltax].freeze
+    CHECKER_PATH = "checkers/voltax/checker.py"
+    PUBLIC_ROUTE_PREFIXES = %w[
+      /api/auth/
+      /api/accounts/
+      /api/orders
+      /api/markets/
+      /api/trades/
+      /api/rfq/
+      /api/broker/
+      /api/conditional-orders
+      /api/feed/public
+    ].freeze
+    FORBIDDEN_SPLOIT_PATTERNS = {
+      "direct database access" => /\b(?:psql|postgresql?:\/\/|DATABASE_URL|Sequel|ActiveRecord|sqlite3?|mysql)\b/i,
+      "debug/admin route" => %r{/(?:api/)?(?:debug|admin|internal|__debug|fix|exploit)\b}i,
+      "fake flag endpoint" => %r{/flag\b}i
+    }.freeze
+
+    module_function
+
+    def run(argv)
+      options = {
+        participant_tree: auto_participant_tree,
+        evidence: DEFAULT_EVIDENCE_PATH,
+        live: false,
+        fixed_live: false,
+        keep_tmp: false
+      }
+      parser = OptionParser.new do |opts|
+        opts.banner = "usage: ruby #{File.basename(__FILE__)} [options]"
+        opts.on("--admin-root PATH", "Organizer/admin package root. Defaults to script root.") { |value| options[:admin_root] = File.expand_path(value) }
+        opts.on("--participant-tree PATH", "Extracted participant source tree.") { |value| options[:participant_tree] = File.expand_path(value) }
+        opts.on("--evidence PATH", "Write JSON evidence to PATH.") { |value| options[:evidence] = File.expand_path(value) }
+        opts.on("--live", "Boot participant source and run exploit-positive smoke.") { options[:live] = true }
+        opts.on("--fixed-live", "Also boot one fixed overlay per EX and run targeted negative smoke.") do
+          options[:live] = true
+          options[:fixed_live] = true
+        end
+        opts.on("--keep-tmp", "Keep temporary live trees for debugging.") { options[:keep_tmp] = true }
+        opts.on("-h", "--help", "Show this help.") do
+          puts opts
+          exit 0
+        end
+      end
+      parser.parse!(argv)
+      options[:admin_root] ||= ROOT
+
+      validator = Validator.new(options)
+      evidence = redact_evidence(validator.run)
+      write_json(options[:evidence], evidence)
+      puts JSON.pretty_generate(summary(evidence))
+      exit(evidence[:ok] ? 0 : 1)
+    end
+
+    def auto_participant_tree
+      if File.directory?(INTERNAL_PARTICIPANT_TREE)
+        INTERNAL_PARTICIPANT_TREE
+      else
+        DEFAULT_PARTICIPANT_TREE
+      end
+    end
+
+    def write_json(path, object)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, JSON.pretty_generate(object))
+    end
+
+    def redact_evidence(value)
+      case value
+      when Hash
+        value.each_with_object({}) do |(key, child), memo|
+          memo[key] = sensitive_key?(key) ? "[redacted]" : redact_evidence(child)
+        end
+      when Array
+        value.map { |child| redact_evidence(child) }
+      when String
+        value
+          .gsub(/("flag_id"\s*:\s*")[^"]+(")/i, "\\1[redacted]\\2")
+          .gsub(/("(?:token|password|credential)"\s*:\s*")[^"]+(")/i, "\\1[redacted]\\2")
+          .gsub(/Bearer\s+[A-Za-z0-9_\-.=]{20,}/, "Bearer [redacted]")
+      else
+        value
+      end
+    end
+
+    def sensitive_key?(key)
+      key.to_s.match?(/\A(?:flag_id|token|password|credential|private)\z/i)
+    end
+
+    def summary(evidence)
+      {
+        ok: evidence[:ok],
+        mode: evidence[:mode],
+        participant_tree: evidence[:participant_tree],
+        admin_root: evidence[:admin_root],
+        failed_checks: evidence[:failures],
+        static: evidence[:static].transform_values { |rows| rows.is_a?(Array) ? rows.count { |row| row[:ok] } : rows },
+        live_positive: evidence.dig(:live, :positive)&.transform_values { |row| row[:ok] },
+        live_fixed_negative: evidence.dig(:live, :fixed_negative)&.transform_values { |row| row[:ok] }
+      }.compact
+    end
+
+    class Validator
+      def initialize(options)
+        @admin_root = options.fetch(:admin_root)
+        @participant_tree = options.fetch(:participant_tree)
+        @live = options.fetch(:live)
+        @fixed_live = options.fetch(:fixed_live)
+        @keep_tmp = options.fetch(:keep_tmp)
+        @python = ENV.fetch("PYTHON", "python")
+        @checker_credential = ENV.fetch("VOLTAX_CHECKER_SECRET", "w21-d-local-checker-credential")
+      end
+
+      def run
+        evidence = {
+          generated_at: Time.now.utc.iso8601,
+          mode: mode,
+          admin_root: @admin_root,
+          participant_tree: @participant_tree,
+          admin_root_sha256: tree_digest(@admin_root),
+          participant_tree_sha256: tree_digest(@participant_tree),
+          static: static_checks,
+          live: {}
+        }
+
+        if @live
+          evidence[:live] = run_live_checks
+        else
+          evidence[:live] = { status: "not_run", reason: "live mode not requested" }
+        end
+
+        failures = collect_failures(evidence)
+        evidence[:failures] = failures
+        evidence[:ok] = failures.empty?
+        evidence
+      end
+
+      private
+
+      def mode
+        @fixed_live ? "static+live+fixed-live" : (@live ? "static+live" : "static")
+      end
+
+      def static_checks
+        {
+          python_compile: python_compile,
+          sploit_public_api_scan: sploit_public_api_scan,
+          patch_apply_check: patch_apply_check,
+          participant_exclusion_check: participant_exclusion_check
+        }
+      end
+
+      def python_compile
+        script = <<~PY
+          import pathlib
+          root = pathlib.Path(".")
+          for directory in #{PYTHON_DIRECTORIES.inspect}:
+              for path in sorted((root / directory).glob("**/*.py")):
+                  if "__pycache__" in path.parts:
+                      continue
+                  compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          print("compiled")
+        PY
+        [command("python compile", [@python, "-B", "-c", script], chdir: @admin_root)]
+      end
+
+      def sploit_public_api_scan
+        EX_ROWS.map do |ex_id, row|
+          relative = row.fetch(:sploit)
+          path = File.join(@admin_root, relative)
+          if !File.file?(path)
+            next result(false, "missing #{relative}", ex_id: ex_id, path: relative)
+          end
+
+          source = File.read(path, encoding: "UTF-8")
+          forbidden_hits = FORBIDDEN_SPLOIT_PATTERNS.filter_map do |label, pattern|
+            label if source.match?(pattern)
+          end
+          public_route_hits = PUBLIC_ROUTE_PREFIXES.select { |route| source.include?(route) }
+          ok = forbidden_hits.empty? && source.include?("urllib.request") && !public_route_hits.empty?
+          result(
+            ok,
+            ok ? "uses public HTTP APIs only by static scan" : "static API scan failed",
+            ex_id: ex_id,
+            path: relative,
+            public_routes: public_route_hits,
+            forbidden_hits: forbidden_hits
+          )
+        end
+      end
+
+      def patch_apply_check
+        return [result(false, "participant tree not found", participant_tree: @participant_tree)] unless File.directory?(@participant_tree)
+
+        EX_ROWS.map do |ex_id, row|
+          patch = File.join(@admin_root, row.fetch(:patch))
+          if !File.file?(patch)
+            next result(false, "missing patch", ex_id: ex_id, patch: row.fetch(:patch))
+          end
+
+          command("patch dry-run #{ex_id}", ["git", "apply", "--check", patch], chdir: @participant_tree)
+            .merge(ex_id: ex_id, patch: row.fetch(:patch))
+        end
+      end
+
+      def participant_exclusion_check
+        fixes = Dir.glob(File.join(@participant_tree, "**", "fixes"), File::FNM_DOTMATCH)
+        sploits = Dir.glob(File.join(@participant_tree, "**", "sploits"), File::FNM_DOTMATCH)
+        checkers = Dir.glob(File.join(@participant_tree, "**", "checkers"), File::FNM_DOTMATCH)
+        validator_hits = Dir.glob(File.join(@participant_tree, "**", "validate_fix_matrix.rb"), File::FNM_DOTMATCH)
+        hits = (fixes + sploits + checkers + validator_hits).map { |path| rel(path, @participant_tree) }.sort
+        [result(hits.empty?, hits.empty? ? "participant tree excludes admin toolchain" : "participant tree contains admin-only paths", hits: hits)]
+      end
+
+      def run_live_checks
+        live = { status: "run", positive: {}, fixed_negative: {}, normal_workflow_after_fix: {} }
+        begin
+          with_participant_copy("w21d-vuln") do |tree|
+            stand = Stand.new(tree, "w21d-vuln", @checker_credential)
+            begin
+              stand.start!
+              live[:positive] = run_positive_matrix(stand)
+            ensure
+              stand.stop!
+            end
+          end
+        rescue StandardError => error
+          live[:positive_setup] = result(false, "vulnerable participant stand failed to boot", error: error.message[0, 4000])
+        end
+
+        if @fixed_live
+          EX_ROWS.each_key do |ex_id|
+            begin
+              with_participant_copy("w21d-#{ex_id.downcase}") do |tree|
+                patch = File.join(@admin_root, EX_ROWS.fetch(ex_id).fetch(:patch))
+                apply = command("apply #{ex_id}", ["git", "apply", patch], chdir: tree)
+                unless apply[:ok]
+                  live[:fixed_negative][ex_id] = apply.merge(ex_id: ex_id)
+                  next
+                end
+
+                stand = Stand.new(tree, "w21d-#{ex_id.downcase.gsub(/[^a-z0-9]/, "")}", @checker_credential)
+                begin
+                  stand.start!
+                  workflow = checker_workflow(stand.host, "workflow-#{ex_id}")
+                  negative = run_exploit_row(stand, ex_id, expected_target: true)
+                  negative[:ok] = !negative[:recovered_target]
+                  negative[:note] = negative[:ok] ? "targeted exploit no longer recovered target" : "targeted exploit still recovered target"
+                  live[:normal_workflow_after_fix][ex_id] = workflow
+                  live[:fixed_negative][ex_id] = negative
+                ensure
+                  stand.stop!
+                end
+              end
+            rescue StandardError => error
+              setup_error = result(false, "fixed participant stand failed to boot", ex_id: ex_id, error: error.message[0, 4000])
+              live[:normal_workflow_after_fix][ex_id] = setup_error
+              live[:fixed_negative][ex_id] = setup_error
+            end
+          end
+        else
+          live[:fixed_negative] = { status: "not_run", reason: "fixed live mode not requested" }
+        end
+        live
+      end
+
+      def run_positive_matrix(stand)
+        EX_ROWS.each_with_object({}) do |(ex_id, _row), memo|
+          memo[ex_id] = run_exploit_row(stand, ex_id, expected_target: true)
+        end
+      end
+
+      def run_exploit_row(stand, ex_id, expected_target:)
+        target = "W21D-#{ex_id}-#{SecureRandom.hex(8)}"
+        attack_data = ex_id == "EX-4" ? create_ex4_attack_data(stand.host, target) : checker_put(stand.host, EX_ROWS.fetch(ex_id).fetch(:place), target)
+        extra_checks = {}
+        if ex_id == "EX-3"
+          extra_checks[:outsider_negative] = ex3_outsider_negative(stand.host, attack_data, target)
+        end
+        sploit = File.join(@admin_root, EX_ROWS.fetch(ex_id).fetch(:sploit))
+        result_row = command("sploit #{ex_id}", [@python, sploit, stand.host, JSON.generate("public" => attack_data)], chdir: @admin_root)
+        recovered = result_row[:stdout].include?(target)
+        recovered ||= result_row[:stderr].include?(target)
+        result_row[:stdout] = result_row[:stdout].gsub(target, "[target]")
+        result_row[:stderr] = result_row[:stderr].gsub(target, "[target]")
+        expected_ok = expected_target ? recovered : !recovered
+        extra_ok = extra_checks.values.all? { |row| row[:ok] }
+        result_row.merge(
+          ex_id: ex_id,
+          target_sha256: Digest::SHA256.hexdigest(target),
+          recovered_target: recovered,
+          extra_checks: extra_checks,
+          ok: expected_ok && extra_ok
+        )
+      end
+
+      def ex3_outsider_negative(host, attack_data, target)
+        trade_id = attack_data.fetch("trade_id")
+        nonce = SecureRandom.hex(4)
+        token = register_user(host, "e3o-#{nonce}", "spot")
+        response = request_raw(host, "GET", "/api/trades/#{URI.encode_www_form_component(trade_id.to_s)}", token: token)
+        body = response[:body].gsub(target, "[target]")
+        {
+          ok: response[:code] == 404 && !body.include?("[target]"),
+          label: "EX-3 outsider trade detail negative",
+          status: response[:code],
+          body: body[0, 600]
+        }
+      rescue StandardError => error
+        {
+          ok: false,
+          label: "EX-3 outsider trade detail negative",
+          error: error.message[0, 600]
+        }
+      end
+
+      def checker_workflow(host, label)
+        rows = [
+          run_checker("check", host, label),
+          run_checker("havoc", host, label)
+        ]
+        (1..4).each do |place|
+          target = "W21D-#{label}-P#{place}-#{SecureRandom.hex(6)}"
+          put = checker_put_raw(host, place, target, label)
+          if put[:ok]
+            public = JSON.parse(put[:stdout])
+            flag_id = put[:stderr].to_s.strip
+            raise "checker PUT stdout contained private flag_id" if public.key?("flag_id")
+            raise "checker PUT stderr private flag_id missing" if flag_id.empty?
+            rows << put.merge(action: "put", place: place, target_sha256: Digest::SHA256.hexdigest(target))
+            rows << run_checker("GET", host, label, flag_id, target, place.to_s)
+          else
+            rows << put.merge(action: "put", place: place, target_sha256: Digest::SHA256.hexdigest(target))
+          end
+        end
+        { ok: rows.all? { |row| row[:ok] }, rows: rows }
+      end
+
+      def checker_put(host, place, target)
+        row = checker_put_raw(host, place, target, "put-place-#{place}")
+        raise "checker put place #{place} failed: #{row[:stdout]} #{row[:stderr]}" unless row[:ok]
+
+        public = JSON.parse(row[:stdout])
+        raise "checker PUT stdout contained private flag_id" if public.key?("flag_id")
+
+        public
+      end
+
+      def checker_put_raw(host, place, target, label)
+        run_checker("PUT", host, label, "incoming-#{SecureRandom.hex(8)}", target, place.to_s)
+      end
+
+      def run_checker(action, host, label, *extra)
+        row = command(
+          "checker #{label} #{action}",
+          [@python, CHECKER_PATH, action, host, *extra],
+          chdir: @admin_root,
+          env: {
+            "VOLTAX_CHECKER_SECRET" => @checker_credential,
+            "VOLTAX_CHECKER_POLICY" => "competition",
+            "PYTHONDONTWRITEBYTECODE" => "1"
+          }
+        )
+        row[:ok] = row[:exitstatus] == 101
+        row
+      end
+
+      def create_ex4_attack_data(host, target)
+        nonce = SecureRandom.hex(8)
+        victim_token = register_user(host, "w21d-ex4-victim-#{nonce}", "spot")
+        faucet(host, victim_token, "w21d-ex4-fund-#{nonce}")
+        price = "10.0000"
+        quantity = "1.00000000"
+        response = request_json(
+          host,
+          "POST",
+          "/api/orders",
+          token: victim_token,
+          payload: {
+            market_symbol: "VOLT-USDT",
+            side: "sell",
+            order_type: "limit",
+            limit_price: price,
+            quantity: quantity,
+            order_ref: "w21d-ex4-victim-#{nonce}",
+            reference_code: "w21d-ex4-victim-#{nonce}",
+            booking_ref: target
+          }
+        )
+        order = response.fetch("order")
+        {
+          ex_id: "EX-4",
+          market_symbol: "VOLT-USDT",
+          order_id: order.fetch("id"),
+          side: "sell",
+          price: price,
+          quantity: quantity
+        }
+      end
+
+      def register_user(host, username, account_profile)
+        response = request_json(host, "POST", "/api/auth/register", payload: { username: username, password: "pass-#{username}", account_profile: account_profile })
+        response.fetch("session").fetch("token")
+      end
+
+      def faucet(host, token, idempotency_key)
+        request_json(host, "POST", "/api/faucet", token: token, payload: { idempotency_key: idempotency_key })
+      end
+
+      def request_json(host, method, path, token: nil, payload: nil)
+        response = request_raw(host, method, path, token: token, payload: payload)
+        unless response[:code].between?(200, 299)
+          raise "HTTP #{response[:code]} for #{method} #{path}: #{response[:body][0, 300]}"
+        end
+        JSON.parse(response[:body])
+      end
+
+      def request_raw(host, method, path, token: nil, payload: nil)
+        uri = URI.join(host, path)
+        request = Object.const_get("Net::HTTP::#{method.capitalize}").new(uri)
+        request["Content-Type"] = "application/json"
+        request["Authorization"] = "Bearer #{token}" if token
+        request.body = JSON.generate(payload) if payload
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https", read_timeout: 8) do |http|
+          http.request(request)
+        end
+        { code: response.code.to_i, body: response.body.to_s }
+      end
+
+      def with_participant_copy(name)
+        temp_root = Dir.mktmpdir("voltax-#{name}-")
+        tree = File.join(temp_root, "voltax-exchange-team")
+        FileUtils.cp_r(@participant_tree, tree)
+        yield tree
+      ensure
+        FileUtils.rm_rf(temp_root) if temp_root && !@keep_tmp
+      end
+
+      def command(label, argv, chdir:, env: {})
+        stdout, stderr, status = Open3.capture3(env.merge("PYTHONDONTWRITEBYTECODE" => "1"), *argv, chdir: chdir)
+        {
+          ok: status.success?,
+          label: label,
+          stdout: redact(stdout[0, 4000]),
+          stderr: redact(stderr[0, 4000]),
+          exitstatus: status.exitstatus
+        }
+      end
+
+      def result(ok, message, extra = {})
+        { ok: ok, message: message }.merge(extra)
+      end
+
+      def collect_failures(evidence)
+        failures = []
+        evidence.fetch(:static).each do |group, rows|
+          Array(rows).each do |row|
+            failures << "static #{group}: #{row[:ex_id] || row[:path] || row[:message] || row[:label]}" unless row[:ok]
+          end
+        end
+        live = evidence.fetch(:live)
+        if live[:positive].is_a?(Hash)
+          live[:positive].each { |ex_id, row| failures << "live positive #{ex_id}" unless row[:ok] }
+        end
+        failures << "live vulnerable participant setup" if live[:positive_setup].is_a?(Hash) && !live[:positive_setup][:ok]
+        if live[:normal_workflow_after_fix].is_a?(Hash)
+          live[:normal_workflow_after_fix].each { |ex_id, row| failures << "live normal workflow after #{ex_id}" unless row[:ok] }
+        end
+        if live[:fixed_negative].is_a?(Hash)
+          live[:fixed_negative].each do |ex_id, row|
+            next if ex_id == :status || ex_id == "status"
+
+            failures << "live fixed negative #{ex_id}" unless row[:ok]
+          end
+        end
+        failures
+      end
+
+      def tree_digest(root)
+        return nil unless File.directory?(root)
+
+        digest = Digest::SHA256.new
+        Dir.chdir(root) do
+          Dir.glob("**/*", File::FNM_DOTMATCH).select { |entry| File.file?(entry) }.sort.each do |relative|
+            next if relative.start_with?(".git/")
+
+            digest.update(relative)
+            digest.update("\0")
+            digest.update(File.binread(relative))
+            digest.update("\0")
+          end
+        end
+        digest.hexdigest.upcase
+      end
+
+      def rel(path, root)
+        Pathname.new(path).relative_path_from(Pathname.new(root)).to_s.tr("\\", "/")
+      rescue StandardError
+        path
+      end
+
+      def redact(value)
+        value.to_s.gsub(@checker_credential, "[checker-credential]")
+      end
+    end
+
+    class Stand
+      attr_reader :host
+
+      def initialize(tree, project_name, checker_credential)
+        @tree = tree
+        @project_name = project_name
+        @checker_credential = checker_credential
+        @port = free_port
+        @host = "http://127.0.0.1:#{@port}"
+      end
+
+      def start!
+        rewrite_compose_port!
+        compose("down", "--remove-orphans", "-v")
+        compose("build")
+        migrate!
+        compose("up", "-d")
+        wait_for_health!
+      end
+
+      def stop!
+        compose("down", "--remove-orphans", "-v")
+      end
+
+      def tick_matching_engine
+        compose("run", "--rm", "matching-engine", "matching-engine", "once")
+      end
+
+      private
+
+      def compose(*args)
+        result = compose_result(*args)
+        raise "docker compose #{args.join(' ')} failed: #{result[:stdout]}\n#{result[:stderr]}" unless result[:ok]
+
+        result
+      end
+
+      def compose_result(*args)
+        env = {
+          "VOLTAX_SECRET_KEY_BASE" => "w21-d-validation-credential-key-base-#{@project_name}-local",
+          "VOLTAX_POSTGRES_PASSWORD" => "w21-d-postgres-#{@project_name}",
+          "VOLTAX_CHECKER_SECRET" => @checker_credential,
+          "COMPOSE_PROJECT_NAME" => @project_name
+        }
+        stdout, stderr, status = Open3.capture3(env, "docker", "compose", "--project-name", @project_name, *args, chdir: @tree)
+        { ok: status.success?, stdout: stdout, stderr: stderr, status: status.exitstatus }
+      end
+
+      def migrate!
+        normal = compose_result("run", "--rm", "exchange-api", "migrate")
+        return normal if normal[:ok]
+        raise "docker compose run --rm exchange-api migrate failed: #{normal[:stdout]}\n#{normal[:stderr]}" unless normal[:stderr].include?("No Rakefile")
+
+        code = <<~RUBY
+          require_relative "config/environment"
+          require_relative "lib/voltax/db"
+          VoltaX::DB.with_connection { |database| VoltaX::DB.migrate(database: database) }
+          puts "Database migrations complete"
+        RUBY
+        compose("run", "--rm", "exchange-api", "ruby", "-e", code)
+      end
+
+      def wait_for_health!
+        deadline = Time.now + 90
+        uri = URI.join(@host, "/health")
+        loop do
+          begin
+            response = Net::HTTP.get_response(uri)
+            return if response.code.to_i.between?(200, 299)
+          rescue StandardError
+            nil
+          end
+          raise "service did not become healthy at #{@host}" if Time.now > deadline
+
+          sleep 1
+        end
+      end
+
+      def rewrite_compose_port!
+        compose_path = File.join(@tree, "docker-compose.yml")
+        content = File.read(compose_path, encoding: "UTF-8")
+        content = content.gsub(/-\s+"(?:127\.0\.0\.1:)?\d+:9292"/, "- \"127.0.0.1:#{@port}:9292\"")
+        File.write(compose_path, content)
+      end
+
+      def free_port
+        server = TCPServer.new("127.0.0.1", 0)
+        server.addr[1]
+      ensure
+        server&.close
+      end
+    end
+  end
+end
+
+Release::ValidateFixMatrix.run(ARGV) if $PROGRAM_NAME == __FILE__

@@ -1,0 +1,12 @@
+diff --git a/internal/httpapi/activity_views.go b/internal/httpapi/activity_views.go
+--- a/internal/httpapi/activity_views.go
++++ b/internal/httpapi/activity_views.go
+@@ -16,7 +16,7 @@ func (s *Server) caseAuditViewsForActivityStream(_ context.Context, _ int64, _ i
+ func (s *Server) entityActivityViewsForActivityStream(ctx context.Context, _ int64, _ string, events []auditrepo.EntityActivityEvent) ([]EntityActivityView, error) {
+ 	return s.entityActivityViewsWithDetail(ctx, events, auditrepo.ActivityAudienceRelatedEntity, func(event auditrepo.EntityActivityEvent) auditrepo.ActivityDetailLevel {
+ 		if event.ObjectType == "case_note" && hasControlledActivityChange(event.DiffJSON) {
+-			return auditrepo.ActivityDetailCollaborator
++			return auditrepo.ActivityDetailRelated
+ 		}
+ 		return auditrepo.ActivityDetailRelated
+ 	})

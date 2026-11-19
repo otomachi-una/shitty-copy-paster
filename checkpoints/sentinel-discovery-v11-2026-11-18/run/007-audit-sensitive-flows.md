@@ -1,0 +1,4 @@
+Review turn 956ad1fdcfe6
+Run an independent source-to-sink pass. Starting from sensitive fields in schemas and writes (private records, confidential comments, credentials, tokens, customer data, and internal metadata), trace every reader across files to exact response fields, events, exports, logs, caches, or other outputs. At each reader record the principal, object identity, policy check, and final sink. Do not treat shared grouping access as permission to read every field, and do not call an intermediate copy a leak unless it reaches an unauthorized sink. List candidate findings with exact paths/functions and evidence; mark reviewed flows without a candidate. Do not write fixes or solvers; finish with the receipt line.
+
+End with this exact receipt line on its own: RECEIVED-0fb317ce0cd2

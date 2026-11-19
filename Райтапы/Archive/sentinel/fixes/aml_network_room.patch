@@ -1,0 +1,48 @@
+diff --git a/internal/networkroom/dossier_context.go b/internal/networkroom/dossier_context.go
+--- a/internal/networkroom/dossier_context.go
++++ b/internal/networkroom/dossier_context.go
+@@ -74,8 +74,8 @@ func BuildExtendedDossier(requesterUserID int64, room RoomSummary, cases []Exte
+ 			UpdatedAt:             c.UpdatedAt.UTC(),
+ 		}
+ 		if !summary.OwnedByRequester {
+-			summary.ContextBlocks = boundedContextBlocks(c.ContextBlocks)
+-			summary.EvaluationBlocks = boundedEvaluationBlocks(c.EvaluationBlocks)
++			summary.ContextBlocks = boundedContextBlocks(c.ContextBlocks, classification.RoomCoverageSummaryMaterial)
++			summary.EvaluationBlocks = boundedEvaluationBlocks(c.EvaluationBlocks, classification.RoomCoverageSummaryMaterial)
+ 			summary.ScopeCoverageComplete = len(summary.ContextBlocks) == 0 && len(summary.EvaluationBlocks) == 0
+ 		}
+ 		summaries = append(summaries, summary)
+@@ -96,11 +96,13 @@ func BuildExtendedDossier(requesterUserID int64, room RoomSummary, cases []Exte
+-func boundedContextBlocks(blocks []DossierContextBlock) []DossierContextBlock {
++func boundedContextBlocks(blocks []DossierContextBlock, requiredCoverage string) []DossierContextBlock {
++	requiredCoverage = normalizeArtifactCoverage(requiredCoverage)
+ 	bounded := make([]DossierContextBlock, 0, len(blocks))
+ 	for _, block := range blocks {
+-		if block.BlockID <= 0 || block.CaseID <= 0 || strings.TrimSpace(block.Content) == "" {
++		coverage := normalizeArtifactCoverage(block.CoveragePolicy)
++		if block.BlockID <= 0 || block.CaseID <= 0 || strings.TrimSpace(block.Content) == "" || coverage != requiredCoverage {
+ 			continue
+ 		}
+ 		bounded = append(bounded, DossierContextBlock{
+ 			BlockID:        block.BlockID,
+ 			CaseID:         block.CaseID,
+-			CoveragePolicy: normalizeArtifactCoverage(block.CoveragePolicy),
++			CoveragePolicy: coverage,
+ 			Content:        strings.TrimSpace(block.Content),
+@@ -113,11 +115,13 @@ func boundedContextBlocks(blocks []DossierContextBlock) []DossierContextBlock {
+-func boundedEvaluationBlocks(blocks []DossierEvaluationBlock) []DossierEvaluationBlock {
++func boundedEvaluationBlocks(blocks []DossierEvaluationBlock, requiredCoverage string) []DossierEvaluationBlock {
++	requiredCoverage = normalizeArtifactCoverage(requiredCoverage)
+ 	bounded := make([]DossierEvaluationBlock, 0, len(blocks))
+ 	for _, block := range blocks {
+-		if block.BlockID <= 0 || block.CustomerID <= 0 || strings.TrimSpace(block.Content) == "" {
++		coverage := normalizeArtifactCoverage(block.CoveragePolicy)
++		if block.BlockID <= 0 || block.CustomerID <= 0 || strings.TrimSpace(block.Content) == "" || coverage != requiredCoverage {
+ 			continue
+ 		}
+ 		bounded = append(bounded, DossierEvaluationBlock{
+ 			BlockID:        block.BlockID,
+ 			CustomerID:     block.CustomerID,
+-			CoveragePolicy: normalizeArtifactCoverage(block.CoveragePolicy),
++			CoveragePolicy: coverage,
+ 			Content:        strings.TrimSpace(block.Content),

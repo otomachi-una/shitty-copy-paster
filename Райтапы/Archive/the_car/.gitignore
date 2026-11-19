@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+
+# Pre-generated signing keys: public .env files only, never the private JSON.
+deploy/keys/private/
+
+__pycache__/
+*.py[cod]

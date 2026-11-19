@@ -1,0 +1,600 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "find"
+require "json"
+require "net/http"
+require "open3"
+require "securerandom"
+require "socket"
+require "tmpdir"
+require "uri"
+
+class SoakFailure < StandardError; end
+
+def find_free_port
+  server = TCPServer.new("127.0.0.1", 0)
+  server.addr[1]
+ensure
+  server&.close
+end
+
+ROOT = File.expand_path("..", __dir__)
+SERVICE_ROOT = File.expand_path(ENV.fetch("W18C_SERVICE_ROOT", ROOT))
+ADMIN_ROOT = File.expand_path(ENV.fetch("W18C_ADMIN_ROOT", ROOT))
+PYTHON = ENV.fetch("PYTHON", "python")
+ROUNDS = Integer(ENV.fetch("W18C_ROUNDS", "7"), 10)
+CHECKER_SECRET = ENV.fetch("VOLTAX_CHECKER_SECRET", "w18c-checker-credential-#{SecureRandom.hex(16)}")
+SECRET_KEY_BASE = ENV.fetch("VOLTAX_SECRET_KEY_BASE", "w18c-credential-key-base-#{SecureRandom.hex(24)}")
+POSTGRES_PASSWORD = ENV.fetch("VOLTAX_POSTGRES_PASSWORD", "w18c-postgres-#{SecureRandom.hex(12)}")
+HOST_PORT = ENV.fetch("W18C_HOST_PORT", nil)
+HOST = ENV.fetch("W18C_HOST", "http://localhost:#{HOST_PORT || find_free_port}")
+PROJECT = ENV.fetch("W18C_PROJECT", "voltax_w18c_soak")
+COMPOSE_OVERRIDE_DIR = Dir.mktmpdir("voltax-w18c-compose-")
+COMPOSE_OVERRIDE_FILE = File.join(COMPOSE_OVERRIDE_DIR, "ports.yml")
+$compose_touched = false
+
+SERVICE_TREE_FINGERPRINT_PATHS = [
+  "bin/run-retention-soak",
+  "bin/matching-engine",
+  "bin/market-simulator",
+  "docker-compose.yml",
+  "docker-compose.competition.yml",
+  "docker-compose.dev.yml",
+  "lib/voltax/services",
+  "lib/voltax/repositories",
+  "lib/voltax/presenters",
+  "lib/voltax/web/application.rb",
+  "db/migrations"
+].freeze
+
+ADMIN_TREE_FINGERPRINT_PATHS = [
+  "bin/run-retention-soak",
+  "bin/run-checker-matrix",
+  "bin/validate-wave18",
+  "bin/validate-fix-matrix",
+  "checkers/voltax",
+  "sploits/voltax",
+  "fixes/voltax",
+  "config.yml",
+  "forcad.yml"
+].freeze
+
+TREE_FINGERPRINT_EXCLUDES = %w[__pycache__ .pytest_cache].freeze
+
+FORBIDDEN_PUBLIC_KEYS = %w[
+  password token token_digest session_id user_id owner_user_id broker_user_id trader_user_id
+  idempotency_key reference_id execution_memo client_reference booking_ref
+  delivery_terms booking_marker settlement_marker workup_terms signal_context wallet_id ledger_id
+  database_url internal_path stack backtrace raw orm flag flag_id checker_credential
+].freeze
+
+at_exit do
+  FileUtils.remove_entry(COMPOSE_OVERRIDE_DIR) if Dir.exist?(COMPOSE_OVERRIDE_DIR)
+end
+
+def common_env(extra = {})
+  {
+    "VOLTAX_SECRET_KEY_BASE" => SECRET_KEY_BASE,
+    "VOLTAX_POSTGRES_PASSWORD" => POSTGRES_PASSWORD,
+    "VOLTAX_CHECKER_SECRET" => CHECKER_SECRET
+  }.merge(extra)
+end
+
+def redact(text, flags = [])
+  redacted = text.to_s.gsub(CHECKER_SECRET, "[checker-credential]")
+  redacted = redacted.gsub(SECRET_KEY_BASE, "[credential-key-base]")
+  redacted = redacted.gsub(POSTGRES_PASSWORD, "[postgres-password]")
+  flags.each { |flag| redacted = redacted.gsub(flag.to_s, "[flag]") }
+  redacted.gsub(/Bearer [A-Za-z0-9_\-]+=*/, "Bearer [token]")
+end
+
+def run!(label, argv, chdir: ROOT, env: {}, flags: [], success_codes: [0], print_output: false, timeout: nil)
+  stdout, stderr, status = capture(argv, chdir: chdir, env: env, timeout: timeout)
+  output = [stdout, stderr].reject(&:empty?).join("\n")
+  unless success_codes.include?(status.exitstatus)
+    warn "FAIL #{label}"
+    warn redact(output, flags)[0, 4000]
+    raise SoakFailure, "#{label} exited #{status.exitstatus}"
+  end
+  puts "PASS #{label}"
+  puts redact(output, flags) if print_output && !output.empty?
+  [stdout, stderr, status.exitstatus]
+end
+
+def capture(argv, chdir: ROOT, env: {}, timeout: nil)
+  return Open3.capture3(env, *argv, chdir: chdir) unless timeout
+
+  stdout = +""
+  stderr = +""
+  status = nil
+  Open3.popen3(env, *argv, chdir: chdir) do |stdin, out, err, wait_thread|
+    stdin.close
+    unless wait_thread.join(timeout)
+      Process.kill("KILL", wait_thread.pid)
+      wait_thread.join(2)
+      raise SoakFailure, "BLOCKED_ENV #{argv.join(' ')} timed out after #{timeout}s"
+    end
+    stdout = out.read
+    stderr = err.read
+    status = wait_thread.value
+  end
+  [stdout, stderr, status]
+end
+
+def write_compose_override
+  port = URI(HOST).port
+  File.write(
+    COMPOSE_OVERRIDE_FILE,
+    <<~YAML
+      services:
+        exchange-api:
+          ports: !override
+            - "#{port}:9292"
+          environment:
+            VOLTAX_PUBLIC_BASE_URL: "#{HOST}"
+    YAML
+  )
+end
+
+def compose_args
+  files = [
+    File.join(SERVICE_ROOT, "docker-compose.yml"),
+    File.join(SERVICE_ROOT, "docker-compose.competition.yml"),
+    COMPOSE_OVERRIDE_FILE
+  ].select { |path| File.file?(path) }
+
+  [
+    "docker", "compose",
+    "--env-file", File.join(SERVICE_ROOT, ".env.example"),
+    "-p", PROJECT,
+    *files.flat_map { |path| ["-f", path] }
+  ]
+end
+
+def compose!(label, *args, flags: [], print_output: false, timeout: nil)
+  $compose_touched = true
+  run!(label, compose_args + args, chdir: SERVICE_ROOT, env: common_env, flags: flags, print_output: print_output, timeout: timeout)
+end
+
+def ensure_docker_daemon!
+  stdout, stderr, status = capture(["docker", "version", "--format", "{{.Server.Version}}"], timeout: 15)
+  return stdout.strip if status.success? && !stdout.strip.empty?
+
+  warn "BLOCKED_ENV docker daemon unavailable for live W18-C soak"
+  warn redact([stdout, stderr].reject(&:empty?).join("\n"))[0, 4000]
+  raise SoakFailure, "BLOCKED_ENV docker daemon unavailable"
+end
+
+def scoped_tree_fingerprint(root, relative_paths)
+  files = relative_paths.flat_map do |relative|
+    path = File.join(root, relative)
+    if File.directory?(path)
+      Find.find(path).filter_map do |entry|
+        entry_relative = entry.delete_prefix(root).sub(%r{\A[\\/]}, "")
+        parts = entry_relative.split(/[\\\/]/)
+        if (parts & TREE_FINGERPRINT_EXCLUDES).any?
+          Find.prune if File.directory?(entry)
+          next
+        end
+        File.file?(entry) ? entry_relative.tr("\\", "/") : nil
+      end
+    elsif File.file?(path)
+      relative.tr("\\", "/")
+    end
+  end.compact.sort
+
+  digest = Digest::SHA256.new
+  files.each do |relative|
+    digest.update(relative)
+    digest.update("\0")
+    digest.update(File.binread(File.join(root, relative)))
+    digest.update("\0")
+  end
+  [digest.hexdigest, files.length]
+end
+
+def ensure_competition_db_internal!
+  stdout, = compose!("compose config no-db-port", "config")
+  data = parse_compose_yaml(stdout)
+  ports = data.dig("services", "postgres", "ports")
+  raise SoakFailure, "competition profile publishes postgres ports" if ports && !ports.empty?
+
+  puts "PASS competition profile keeps postgres internal"
+end
+
+def parse_compose_yaml(text)
+  require "yaml"
+
+  YAML.safe_load(text, permitted_classes: [], aliases: true) || {}
+rescue StandardError => error
+  raise SoakFailure, "compose config parse failed: #{error.message}"
+end
+
+def start_service
+  compose!("compose cleanup #{PROJECT}", "down", "--remove-orphans", "-v", timeout: 120)
+  ensure_competition_db_internal!
+  compose!("compose build #{PROJECT}", "build", "exchange-api", "matching-engine", "market-simulator", timeout: 600)
+  compose!("compose migrate #{PROJECT}", "run", "--rm", "exchange-api", "migrate", timeout: 180)
+  compose!("compose migrate idempotent #{PROJECT}", "run", "--rm", "exchange-api", "migrate", timeout: 180)
+  compose!("compose up #{PROJECT}", "up", "-d", timeout: 180)
+  wait_ready
+  health = fetch_json("#{HOST}/health")
+  ready = fetch_json("#{HOST}/ready")
+  raise SoakFailure, "health not ok" unless health["status"] == "ok"
+  raise SoakFailure, "ready not ready" unless ready["status"] == "ready"
+
+  puts "PASS health/readiness/migrations"
+end
+
+def stop_service
+  compose!("compose cleanup #{PROJECT}", "down", "--remove-orphans", "-v", timeout: 120)
+rescue SoakFailure => error
+  warn "WARN cleanup failed for #{PROJECT}: #{error.message}"
+end
+
+def wait_ready
+  deadline = Time.now + 90
+  loop do
+    begin
+      return if fetch_json("#{HOST}/ready")["status"] == "ready"
+    rescue StandardError
+      nil
+    end
+    raise SoakFailure, "service did not become ready" if Time.now >= deadline
+    sleep 1
+  end
+end
+
+def fetch_json(url)
+  uri = URI(url)
+  response = Net::HTTP.get_response(uri)
+  raise SoakFailure, "#{url} returned HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+  JSON.parse(response.body)
+end
+
+def api_json(method, path, payload: nil, token: nil)
+  uri = URI("#{HOST}#{path}")
+  request = case method
+            when "GET" then Net::HTTP::Get.new(uri)
+            when "POST" then Net::HTTP::Post.new(uri)
+            else raise SoakFailure, "unsupported HTTP method #{method}"
+            end
+  request["Accept"] = "application/json"
+  request["Authorization"] = "Bearer #{token}" if token
+  if payload
+    request["Content-Type"] = "application/json"
+    request.body = JSON.generate(payload)
+  end
+
+  response = Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
+  raise SoakFailure, "#{method} #{path} returned HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+  JSON.parse(response.body)
+end
+
+def checker(action, *args, flags: [], expect_ok: true)
+  stdout, stderr, status = capture(
+    [PYTHON, "checkers/voltax/checker.py", action, HOST, *args],
+    chdir: ADMIN_ROOT,
+    env: common_env("VOLTAX_CHECKER_POLICY" => "competition")
+  )
+  output = [stdout, stderr].join("\n")
+  if expect_ok && status.exitstatus != 101
+    warn redact(output, flags)[0, 4000]
+    raise SoakFailure, "checker #{action} failed with #{status.exitstatus}"
+  end
+  [stdout.strip, stderr.strip, status.exitstatus]
+end
+
+def checker_ok(action, *args, flags: [])
+  stdout, stderr, status = checker(action, *args, flags: flags)
+  raise SoakFailure, "checker #{action} did not return OK" unless status == 101
+
+  puts "PASS checker #{action}"
+  [stdout, stderr]
+end
+
+def checker_put(place, flag)
+  stdout, stderr = checker_ok("PUT", "incoming-#{SecureRandom.hex(8)}", flag, place.to_s, flags: [flag])
+  public = JSON.parse(stdout)
+  raise SoakFailure, "checker PUT stdout must be a public JSON object" unless public.is_a?(Hash)
+  raise SoakFailure, "checker PUT stdout must not contain flag_id" if public.key?("flag_id")
+  private_flag_id = stderr.to_s
+  raise SoakFailure, "checker PUT stderr private flag_id missing" if private_flag_id.empty?
+  validate_public_attack_data!(public, flag)
+  puts "PASS attack data place #{place}: keys=#{public.keys.sort.join(',')}"
+  { "flag_id" => private_flag_id, "public" => public }
+end
+
+def checker_get(place, flag_id, flag)
+  checker_ok("GET", flag_id, flag, place.to_s, flags: [flag, flag_id])
+end
+
+def validate_public_attack_data!(value, flag)
+  case value
+  when Hash
+    value.each do |key, child|
+      raise SoakFailure, "public attack data contains forbidden key #{key}" if FORBIDDEN_PUBLIC_KEYS.include?(key.to_s.downcase)
+
+      validate_public_attack_data!(child, flag)
+    end
+  when Array
+    value.each { |child| validate_public_attack_data!(child, flag) }
+  when String
+    raise SoakFailure, "flag sampleed in public attack data" if value.include?(flag)
+  end
+end
+
+def public_feed(market_symbol: "VOLT-USDT", since_sequence: 0, limit: 100)
+  query = URI.encode_www_form(market: market_symbol, since_sequence: since_sequence, limit: limit)
+  api_json("GET", "/api/feed/public?#{query}")
+end
+
+def run_worker_tick(round)
+  compose!(
+    "round #{round} matching-engine one-shot",
+    "run", "--rm", "matching-engine",
+    "matching-engine", "once",
+    print_output: true,
+    timeout: 180
+  )
+  compose!(
+    "round #{round} market-simulator one-shot",
+    "run", "--rm",
+    "-e", "VOLTAX_SIMULATOR_TICK=#{round}",
+    "market-simulator",
+    "market-simulator", "once",
+    print_output: true,
+    timeout: 180
+  )
+end
+
+def run_round(round, stored)
+  checker_ok("check")
+  checker_ok("havoc")
+  noisy_place2_roundtrip(round)
+  run_worker_tick(round)
+  stored.each do |place, row|
+    checker_get(place, row.fetch(:flag_id), row.fetch(:flag))
+  end
+  feed = public_feed(since_sequence: 0, limit: 10)
+  assert_feed_sequences_monotonic(feed.fetch("events"))
+  puts "PASS round #{round}/#{ROUNDS} checker/workers/feed/intermediate GET"
+end
+
+def setup_all_places(prefix)
+  (1..4).each_with_object({}) do |place, memo|
+    flag = "#{prefix}-PLACE#{place}-#{SecureRandom.hex(8)}"
+    payload = checker_put(place, flag)
+    checker_get(place, payload.fetch("flag_id"), flag)
+    memo[place] = { flag: flag, flag_id: payload.fetch("flag_id"), public: payload.fetch("public") }
+  end
+end
+
+def noisy_place2_roundtrip(round)
+  add_trade_noise("w18c-noise-#{round}")
+  flag = "W18C-NOISY-P2-#{round}-#{SecureRandom.hex(8)}"
+  payload = checker_put(2, flag)
+  checker_get(2, payload.fetch("flag_id"), flag)
+  puts "PASS noisy place-2 receipt owner GET round #{round}"
+end
+
+def add_trade_noise(label)
+  seller = funded_user("#{label}-seller")
+  buyer = funded_user("#{label}-buyer")
+  price = "88.#{SecureRandom.random_number(9)}"
+  quantity = "1.0000"
+  create_order(seller, side: "sell", price: price, quantity: quantity, client_order_id: "#{label}-sell")
+  create_order(buyer, side: "buy", price: price, quantity: quantity, client_order_id: "#{label}-buy")
+end
+
+def rapid_trade_sequence_regression
+  threads = 6.times.map do |index|
+    Thread.new do
+      add_trade_noise("w18c-rapid-#{index}-#{SecureRandom.hex(3)}")
+    end
+  end
+  threads.each(&:value)
+
+  output = internal_sql(<<~SQL)
+    select count(*)::text || ',' ||
+           count(distinct public_sequence)::text || ',' ||
+           count(public_sequence)::text || ',' ||
+           coalesce(bool_and(public_sequence > 0), true)::text || ',' ||
+           coalesce(bool_and(next_sequence > public_sequence), true)::text
+    from (
+      select public_sequence,
+             lead(public_sequence) over (order by public_sequence) as next_sequence
+      from trades
+    ) ordered;
+  SQL
+  count, distinct_count, non_null_count, positive, increasing = output.strip.split(",", 5)
+  unless count == distinct_count && count == non_null_count && truthy_sql?(positive) && truthy_sql?(increasing)
+    raise SoakFailure, "trade public_sequence regression failed: #{output.strip}"
+  end
+  puts "PASS rapid trade public_sequence uniqueness/monotonicity: trades=#{count}"
+end
+
+def truthy_sql?(value)
+  %w[t true].include?(value.to_s.strip.downcase)
+end
+
+def internal_sql(sql)
+  stdout, = compose!(
+    "internal postgres public_sequence query",
+    "exec", "-T", "postgres",
+    "psql", "-U", "voltax", "-d", "voltax_development", "-tA", "-c", sql,
+    timeout: 60
+  )
+  stdout
+end
+
+def ex5_freshness_regression
+  flag = "W18C-EX5-FRESH-#{SecureRandom.hex(8)}"
+  payload = checker_put(4, flag)
+  attack_data = payload.fetch("public")
+  since_sequence = Integer(attack_data.fetch("since_sequence").to_s, 10)
+  argv = [PYTHON, "sploits/voltax/ex_conditional_feed.py", HOST, JSON.generate("public" => attack_data)]
+  stdout, stderr, status = capture(argv, chdir: ADMIN_ROOT, timeout: 30)
+  status_code = status.exitstatus
+
+  unless status_code.zero? && stdout.strip == flag
+    warn redact("#{stdout}\n#{stderr}", [flag])[0, 4000]
+    raise SoakFailure, "EX-5 autonomous freshness exploit did not recover target flag from worker loop"
+  end
+  after = public_feed(since_sequence: since_sequence, limit: 100)
+  assert_feed_sequences_monotonic(after.fetch("events"))
+  puts "PASS EX-5 since_sequence freshness exploit path without manual worker intervention"
+end
+
+def worker_lifecycle_smoke
+  compose!("worker services ps", "ps", "matching-engine", "market-simulator", print_output: true, timeout: 60)
+  compose!("restart matching-engine loop", "restart", "matching-engine", timeout: 120)
+  compose!("restart market-simulator loop", "restart", "market-simulator", timeout: 120)
+  wait_ready
+  puts "PASS worker loop services restart safely"
+end
+
+def restart_service
+  compose!("mid-soak restart exchange-api", "restart", "exchange-api", timeout: 120)
+  wait_ready
+  puts "PASS restart persistence/readiness"
+end
+
+def final_gets(stored)
+  stored.each do |place, row|
+    checker_get(place, row.fetch(:flag_id), row.fetch(:flag))
+  end
+  puts "PASS final owner GETs after retention horizon"
+end
+
+def assert_feed_sequences_monotonic(events)
+  sequences = events.filter_map { |event| event["sequence"] if event.is_a?(Hash) }
+  return if sequences == sequences.sort && sequences.uniq == sequences
+
+  raise SoakFailure, "public feed sequences are not monotonic and unique in response"
+end
+
+def funded_user(label, account_profile: "spot")
+  nonce = SecureRandom.hex(6)
+  token = register_user(unique_username(label, nonce), account_profile)
+  faucet(token, "#{label}-fund-#{nonce}") if account_profile == "spot"
+  token
+end
+
+def unique_username(label, nonce)
+  suffix = "-#{nonce}"
+  budget = 32 - suffix.length
+  base = label.to_s.gsub(/[^a-zA-Z0-9_.-]/, "-")[0, budget]
+  base = "w18c" if base.length < 3
+  "#{base}#{suffix}"
+end
+
+def register_user(username, account_profile)
+  response = api_json(
+    "POST",
+    "/api/auth/register",
+    payload: {
+      username: username,
+      password: "Vx-#{SecureRandom.urlsafe_base64(18)}",
+      account_profile: account_profile
+    }
+  )
+  token = response.dig("session", "token")
+  raise SoakFailure, "registration failed" unless token.is_a?(String) && !token.empty?
+
+  token
+end
+
+def faucet(token, idempotency_key)
+  api_json("POST", "/api/faucet", token: token, payload: { idempotency_key: idempotency_key })
+end
+
+def create_order(token, side:, price:, quantity:, client_order_id:)
+  api_json(
+    "POST",
+    "/api/orders",
+    token: token,
+    payload: {
+      market_symbol: "VOLT-USDT",
+      side: side,
+      order_type: "limit",
+      limit_price: price,
+      quantity: quantity,
+      client_order_id: client_order_id,
+      execution_memo: "w18c-noise-order"
+    }
+  )
+end
+
+def run_static_preflight
+  run!("checker unit tests", [PYTHON, "checkers/voltax/tests/test_checker_lib.py"], chdir: ADMIN_ROOT)
+  run!(
+    "checker and sploit Python compile",
+    [
+      PYTHON, "-m", "py_compile",
+      "checkers/voltax/checker.py",
+      "checkers/voltax/checker_lib.py",
+      "sploits/voltax/ex_client_order_id_collision.py",
+      "sploits/voltax/ex_rfq_preview.py",
+      "sploits/voltax/ex_counterparty_receipt.py",
+      "sploits/voltax/ex_broker_report.py",
+      "sploits/voltax/ex_conditional_feed.py"
+    ],
+    chdir: ADMIN_ROOT
+  )
+  run!("worker Ruby syntax", ["ruby", "-c", "bin/matching-engine"], chdir: SERVICE_ROOT)
+  run!("simulator Ruby syntax", ["ruby", "-c", "bin/market-simulator"], chdir: SERVICE_ROOT)
+end
+
+def main
+  raise SoakFailure, "W18C_ROUNDS must be at least 7" if ROUNDS < 7
+
+  write_compose_override
+  puts "INFO W18-C target host #{HOST}"
+  puts "INFO W18-C compose project #{PROJECT}"
+  service_fingerprint, service_file_count = scoped_tree_fingerprint(SERVICE_ROOT, SERVICE_TREE_FINGERPRINT_PATHS)
+  admin_fingerprint, admin_file_count = scoped_tree_fingerprint(ADMIN_ROOT, ADMIN_TREE_FINGERPRINT_PATHS)
+  puts "INFO W18-C service root #{SERVICE_ROOT}"
+  puts "INFO W18-C admin root #{ADMIN_ROOT}"
+  puts "INFO W18-C service scoped tree fingerprint sha256=#{service_fingerprint} files=#{service_file_count}"
+  puts "INFO W18-C admin scoped tree fingerprint sha256=#{admin_fingerprint} files=#{admin_file_count}"
+  run_static_preflight
+  docker_version = ensure_docker_daemon!
+  puts "PASS docker daemon available: server=#{docker_version}"
+
+  start_service
+  worker_lifecycle_smoke
+  stored = setup_all_places("W18C-SETUP")
+  ex5_freshness_regression
+  rapid_trade_sequence_regression
+  (1..ROUNDS).each do |round|
+    run_round(round, stored)
+    restart_service if round == (ROUNDS / 2)
+  end
+  final_gets(stored)
+  puts "Wave 18 retention stability soak passed"
+rescue SoakFailure => error
+  warn "Wave 18 retention stability soak failed: #{error.message}"
+  exit 1
+ensure
+  stop_service if $compose_touched
+end
+
+if ARGV.include?("--help")
+  puts "usage: ruby bin/run-retention-soak"
+  puts
+  puts "Environment:"
+  puts "  W18C_SERVICE_ROOT=/path/to/voltax-exchange-team"
+  puts "  W18C_ADMIN_ROOT=/path/to/voltax-exchange-admin"
+  puts "  W18C_ROUNDS=7"
+  puts "  W18C_HOST=http://localhost:PORT"
+  puts "  W18C_PROJECT=voltax_soak"
+  exit 0
+end
+
+main

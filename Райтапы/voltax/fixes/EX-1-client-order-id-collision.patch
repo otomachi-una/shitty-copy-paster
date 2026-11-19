@@ -1,0 +1,14 @@
+diff --git a/lib/voltax/reference_directory.rb b/lib/voltax/reference_directory.rb
+--- a/lib/voltax/reference_directory.rb
++++ b/lib/voltax/reference_directory.rb
+@@ -52,9 +52,9 @@
+     attr_reader :order_repository
+ 
+     def reference_scope_for(context)
+-      return :desk_book if context.fetch(:channel) == :desk_order
++      return :account if context.fetch(:channel) == :desk_order
+ 
+       :account
+     end
+   end
+ end

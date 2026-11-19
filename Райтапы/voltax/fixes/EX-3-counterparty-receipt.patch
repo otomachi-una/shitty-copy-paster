@@ -1,0 +1,12 @@
+diff --git a/lib/voltax/presenters/trade_presenter.rb b/lib/voltax/presenters/trade_presenter.rb
+--- a/lib/voltax/presenters/trade_presenter.rb
++++ b/lib/voltax/presenters/trade_presenter.rb
+@@ -30,7 +30,7 @@
+       end
+ 
+       def allocation_notice(receipt)
+-        DTOs::VenueAllocationDTO.notice(receipt)
++        DTOs::VenueAllocationDTO.public_notice(receipt)
+       end
+     end
+   end

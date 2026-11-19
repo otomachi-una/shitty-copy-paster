@@ -1,0 +1,249 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "optparse"
+require "securerandom"
+require "time"
+require "uri"
+
+FORBIDDEN_PUBLIC_KEYS = %w[
+  username password token bearer_token session session_id token_digest hmac_key
+  credential flag flag_id execution_memo client_reference
+  client_reference booking_ref booking_marker desk_ref receipt_private_reference
+  delivery_terms settlement_instructions strategy_note strategy_private_note signal_context wallet_id
+  ledger_id database_url stack backtrace raw orm
+].freeze
+
+SECRET_LIKE_PATTERNS = [
+  ["bearer token", /Bearer\s+[A-Za-z0-9_\-.=]{20,}/],
+  ["private key", /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/],
+  ["credential assignment", /\b(?:password|token|credential|flag_id)\b["'=:\s]+[A-Za-z0-9_\-.=]{12,}/i]
+].freeze
+
+DEFAULT_OPTIONS = {
+  checker_root: Dir.pwd,
+  evidence_path: nil,
+  places: [1, 2, 3, 4],
+  policy: "competition",
+  simulate: false
+}.freeze
+
+def usage(parser)
+  puts parser
+  puts
+  puts "Examples:"
+  puts "  ruby tools/release/validate_pfr_public_data.rb --checker-root . --json tmp/pfr.json http://localhost:9292"
+  puts "  ruby bin/validate-pfr-public-data --simulate --json evidence/pfr-simulated.json"
+end
+
+def parse_args(argv)
+  options = DEFAULT_OPTIONS.dup
+  parser = OptionParser.new do |opts|
+    opts.banner = "usage: ruby validate_pfr_public_data.rb [options] SERVICE_URL"
+    opts.on("--checker-root DIR", "Root containing checkers/voltax or voltax checker files") { |value| options[:checker_root] = value }
+    opts.on("--json PATH", "Write sanitized evidence JSON") { |value| options[:evidence_path] = value }
+    opts.on("--places LIST", "Comma-separated places to test, default 1,2,3,4") do |value|
+      options[:places] = value.split(",").map { |part| Integer(part, 10) }
+    end
+    opts.on("--policy POLICY", "Checker policy, default competition") { |value| options[:policy] = value }
+    opts.on("--simulate", "Validate a synthetic ForcAD PFR stdout/private/public split without a service") { options[:simulate] = true }
+    opts.on("-h", "--help", "Show help") do
+      usage(opts)
+      exit 0
+    end
+  end
+  parser.parse!(argv)
+  options[:host] = argv.shift
+  options[:credential] = ENV.fetch("VOLTAX_CHECKER_SECRET", "w23f-pfr-credential-#{SecureRandom.hex(12)}")
+  abort "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+  abort "SERVICE_URL is required unless --simulate is used" if !options[:simulate] && options[:host].to_s.empty?
+  options
+end
+
+def checker_path(checker_root)
+  candidates = [
+    File.join(checker_root, "checkers", "voltax", "checker.py"),
+    File.join(checker_root, "voltax", "checker.py")
+  ]
+  found = candidates.find { |path| File.file?(path) }
+  abort "checker.py not found under #{checker_root}" unless found
+
+  found.delete_prefix(File.expand_path(checker_root) + File::SEPARATOR).tr("\\", "/")
+end
+
+def sanitize(output, sensitive)
+  sensitive.compact.reduce(output.to_s) do |redacted, value|
+    value.to_s.empty? ? redacted : redacted.gsub(value.to_s, "[redacted]")
+  end
+end
+
+def run_checker(options, action, *args, sensitive: [])
+  root = File.expand_path(options[:checker_root])
+  credential = options.fetch(:credential)
+  stdout, stderr, status = Open3.capture3(
+    {
+      "PYTHONDONTWRITEBYTECODE" => "1",
+      "VOLTAX_CHECKER_SECRET" => credential,
+      "VOLTAX_CHECKER_POLICY" => options[:policy]
+    },
+    ENV.fetch("PYTHON", "python"),
+    checker_path(root),
+    action,
+    *args,
+    chdir: root
+  )
+  output = "#{stdout}\n#{stderr}"
+  unless status.exitstatus == 101
+    warn sanitize(output, [credential, *sensitive])[0, 4000]
+    abort "checker #{action} failed with exit #{status.exitstatus}"
+  end
+
+  [stdout, stderr, status.exitstatus]
+end
+
+def parse_put_messages(stdout, stderr)
+  public = JSON.parse(stdout)
+  abort "PUT stdout must be a public JSON object" unless public.is_a?(Hash)
+  abort "PUT stdout must not contain flag_id" if public.key?("flag_id")
+  flag_id = stderr.strip
+  abort "PUT stderr private flag_id must be a non-empty string" if flag_id.empty?
+  abort "PUT stderr must contain only one private flag_id line" unless stderr == "#{flag_id}\n" || stderr == flag_id
+  abort "PUT stderr private flag_id must not equal public output" if flag_id == stdout.strip
+
+  [flag_id, public]
+rescue JSON::ParserError => error
+  abort "PUT stdout is not valid JSON: #{error.message}"
+end
+
+def scan_public!(value, context:, forbidden_strings:)
+  case value
+  when Hash
+    value.each do |key, child|
+      normalized = key.to_s.downcase
+      abort "#{context} exposes forbidden public key #{key}" if FORBIDDEN_PUBLIC_KEYS.include?(normalized)
+
+      scan_public!(child, context: "#{context}.#{key}", forbidden_strings: forbidden_strings)
+    end
+  when Array
+    value.each_with_index { |child, index| scan_public!(child, context: "#{context}[#{index}]", forbidden_strings: forbidden_strings) }
+  when String
+    forbidden_strings.each do |label, credential|
+      abort "#{context} exposes #{label}" if !credential.to_s.empty? && value.include?(credential.to_s)
+    end
+    SECRET_LIKE_PATTERNS.each do |label, pattern|
+      abort "#{context} contains credential-like #{label}" if value.match?(pattern)
+    end
+  end
+end
+
+def canonical_json(value)
+  case value
+  when Hash
+    "{" + value.keys.sort.map { |key| "#{JSON.generate(key.to_s)}:#{canonical_json(value.fetch(key))}" }.join(",") + "}"
+  when Array
+    "[" + value.map { |child| canonical_json(child) }.join(",") + "]"
+  else
+    JSON.generate(value)
+  end
+end
+
+def digest(value)
+  Digest::SHA256.hexdigest(value.to_s).upcase
+end
+
+def endpoint_probe(host)
+  uri = URI("#{host}/api/client/attack_data")
+  response = Net::HTTP.get_response(uri)
+  body = response.body.to_s
+  if response.is_a?(Net::HTTPSuccess)
+    parsed = JSON.parse(body)
+    scan_public!(parsed, context: "/api/client/attack_data", forbidden_strings: [])
+    { status: response.code.to_i, present: true, sha256: digest(canonical_json(parsed)) }
+  else
+    { status: response.code.to_i, present: false, note: "endpoint absent or not public" }
+  end
+rescue JSON::ParserError
+  { status: response&.code&.to_i, present: true, parse_error: "non-json response" }
+rescue StandardError => error
+  { present: false, error: error.class.name, note: "endpoint probe unavailable" }
+end
+
+def simulated_evidence
+  flag_id = "private-state-#{SecureRandom.hex(16)}"
+  public = {
+    "place" => 1,
+    "attack" => "client_order_lookup",
+    "market_symbol" => "VOLT-USDT",
+    "order_ref" => "PFR-SIM-#{SecureRandom.hex(4)}"
+  }
+  scan_public!(public, context: "simulated.public", forbidden_strings: [["flag_id", flag_id], ["flag", "PFR-SIM-FLAG"]])
+  {
+    mode: "simulated",
+    generated_at: Time.now.utc.iso8601,
+    forcad_stdout_shape: "public JSON object",
+    forcad_stderr_shape: "private opaque flag_id",
+    put_exit_code: 101,
+    get_exit_code: 101,
+    private_flag_id_sha256: digest(flag_id),
+    canonical_public_json_sha256: digest(canonical_json(public)),
+    public_keys: public.keys.sort,
+    public_private_separation: true
+  }
+end
+
+def live_evidence(options)
+  rows = options[:places].map do |place|
+    value = "W23F-PFR-PLACE#{place}-#{SecureRandom.hex(8)}"
+    stdout, stderr, put_exit = run_checker(
+      options,
+      "PUT",
+      options.fetch(:host),
+      "incoming-#{SecureRandom.hex(8)}",
+      value,
+      place.to_s,
+      sensitive: [value]
+    )
+    flag_id, public = parse_put_messages(stdout, stderr)
+    scan_public!(
+      public,
+      context: "place #{place} public",
+      forbidden_strings: [["flag value", value], ["private flag_id", flag_id]]
+    )
+    _get_stdout, _get_stderr, get_exit = run_checker(options, "GET", options.fetch(:host), flag_id, value, place.to_s, sensitive: [flag_id, value])
+    {
+      place: place,
+      put_stdout_shape: "public JSON object",
+      put_stderr_shape: "private opaque flag_id",
+      put_exit_code: put_exit,
+      get_exit_code: get_exit,
+      private_flag_id_sha256: digest(flag_id),
+      canonical_public_json_sha256: digest(canonical_json(public)),
+      public_keys: public.keys.sort,
+      public_private_separation: true
+    }
+  end
+
+  {
+    mode: "live",
+    generated_at: Time.now.utc.iso8601,
+    host: options.fetch(:host),
+    policy: options[:policy],
+    places: rows,
+    attack_data_endpoint_probe: endpoint_probe(options.fetch(:host))
+  }
+end
+
+options = parse_args(ARGV)
+evidence = options[:simulate] ? simulated_evidence : live_evidence(options)
+if options[:evidence_path]
+  FileUtils.mkdir_p(File.dirname(File.expand_path(options[:evidence_path])))
+  File.write(options[:evidence_path], JSON.pretty_generate(evidence))
+end
+
+puts JSON.pretty_generate(evidence)
+puts "pfr public/private boundary validation passed"

@@ -1,0 +1,21 @@
+{
+  "admin_organizer_separate": true,
+  "archive_name": "sentinel-aml-player-source.tar.gz",
+  "artifact_class": "player-source",
+  "artifact_contract": "backend-source-static-frontend-player-distribution.v1",
+  "build_commands": [
+    "go test ./...",
+    "go build ./cmd/aml-api ./cmd/aml-worker ./cmd/aml-migrate"
+  ],
+  "distribution_model": "backend-source-static-frontend-player",
+  "frontend_static": {
+    "included": true,
+    "path": "web/dist",
+    "source_included": false
+  },
+  "primary_player_artifact": true,
+  "runtime_requirements": {
+    "go": "1.22+",
+    "postgres": "16 compatible"
+  }
+}

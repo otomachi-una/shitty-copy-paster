@@ -1,0 +1,8 @@
+checker: checker/checker.py
+checker_timeout: 20
+puts: 1
+gets: 1
+places: 6
+vulns: 6
+checker_type: pfr
+port: 8080

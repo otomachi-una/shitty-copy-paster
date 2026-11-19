@@ -1,0 +1,12 @@
+diff --git a/internal/graph/repository_entity_summaries.go b/internal/graph/repository_entity_summaries.go
+--- a/internal/graph/repository_entity_summaries.go
++++ b/internal/graph/repository_entity_summaries.go
+@@ -9,7 +9,7 @@ func (r *Repository) ListReviewEDDSummaries(ctx context.Context, ownerUserID int
+ 		return nil, err
+ 	}
+ 	summaries := make([]ReviewEDDSummary, 0, len(materials))
+-	policy := ExtendedAssessmentSummaryPolicy()
++	policy := GraphAssessmentSummaryPolicy()
+ 	for _, material := range materials {
+ 		summaries = append(summaries, material.WithAssessmentSummary(policy))
+ 	}

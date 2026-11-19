@@ -1,0 +1,44 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+
+ROOT = File.expand_path("..", __dir__)
+PYTHON = ENV.fetch("PYTHON", "python")
+EXPLOITS = {
+  "EX-1" => "sploits/voltax/ex_client_order_id_collision.py",
+  "EX-2" => "sploits/voltax/ex_rfq_preview.py",
+  "EX-3" => "sploits/voltax/ex_counterparty_receipt.py",
+  "EX-4" => "sploits/voltax/ex_broker_report.py",
+  "EX-5" => "sploits/voltax/ex_conditional_feed.py"
+}.freeze
+
+def usage
+  puts "usage: ruby bin/run-sploits --list"
+  puts "usage: ruby bin/run-sploits EX-1 SERVICE_URL attack-data.json"
+  puts "attack-data.json must contain either the public object or {\"public\": {...}}."
+end
+
+if ARGV == ["--help"] || ARGV == ["-h"]
+  usage
+  exit 0
+end
+
+if ARGV == ["--list"]
+  EXPLOITS.each { |id, path| puts "#{id} #{path}" }
+  exit 0
+end
+
+ex_id, host, attack_data_path = ARGV
+usage && exit(2) unless EXPLOITS.key?(ex_id) && host && attack_data_path
+data = JSON.parse(File.read(attack_data_path))
+data = { "public" => data } unless data.is_a?(Hash) && data.key?("public")
+stdout, stderr, status = Open3.capture3(
+  { "PYTHONDONTWRITEBYTECODE" => "1" },
+  PYTHON, EXPLOITS.fetch(ex_id), host, JSON.generate(data),
+  chdir: ROOT
+)
+warn stderr unless stderr.empty?
+print stdout
+exit status.exitstatus

@@ -1,0 +1,392 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "optparse"
+require "pathname"
+require "socket"
+require "tmpdir"
+require "time"
+require "uri"
+
+module Release
+  module ValidateCoarseDisableMatrix
+    SCRIPT_DIR = File.expand_path(__dir__)
+    ROOT = File.basename(SCRIPT_DIR) == "bin" ? File.expand_path("..", SCRIPT_DIR) : File.expand_path("../..", SCRIPT_DIR)
+    DEFAULT_PARTICIPANT_TREE = File.expand_path(File.join(ROOT, "..", "team", "voltax-exchange-team"))
+    INTERNAL_PARTICIPANT_TREE = File.expand_path(File.join(ROOT, "dist", "team", "voltax-exchange-team"))
+    DEFAULT_EVIDENCE_PATH =
+      if File.basename(SCRIPT_DIR) == "bin"
+        File.join(ROOT, "evidence", "coarse_disable_matrix_evidence.json")
+      else
+        File.join(ROOT, "docs", "release", "coarse_disable_matrix_evidence.json")
+      end
+    CHECKER_PATH = "checkers/voltax/checker.py"
+
+    MUTANTS = {
+      "EX-1" => {
+        surface: "order reference lookup",
+        file: "lib/voltax/web/application.rb",
+        replacements: [
+          ['get "/api/orders/lookup/:reference_code" do', 'get "/api/orders/lookup-disabled/:reference_code" do']
+        ]
+      },
+      "EX-2" => {
+        surface: "RFQ workup",
+        file: "lib/voltax/web/application.rb",
+        replacements: [
+          ['get "/api/rfq/:rfq_id/workup" do', 'get "/api/rfq/:rfq_id/workup-disabled" do']
+        ]
+      },
+      "EX-3" => {
+        surface: "authenticated trade detail",
+        file: "lib/voltax/web/application.rb",
+        replacements: [
+          ['get "/api/trades/:trade_id" do', 'get "/api/trades-disabled/:trade_id" do']
+        ]
+      },
+      "EX-4" => {
+        surface: "broker trade report",
+        file: "lib/voltax/web/application.rb",
+        replacements: [
+          ['get "/api/broker/reports/trades" do', 'get "/api/broker/reports/trades-disabled" do']
+        ]
+      },
+      "EX-5" => {
+        surface: "conditional trigger public feed event",
+        file: "lib/voltax/services/public_feed_service.rb",
+        replacements: [
+          ['event_type: "market_signal_activated",', 'event_type: "market_tick",'],
+          ['public_reason: "market_signal_activated",', 'public_reason: "market_tick",']
+        ]
+      }
+    }.freeze
+
+    module_function
+
+    def run(argv)
+      options = {
+        participant_tree: auto_participant_tree,
+        admin_root: ROOT,
+        evidence: DEFAULT_EVIDENCE_PATH,
+        keep_tmp: false
+      }
+      parser = OptionParser.new do |opts|
+        opts.banner = "usage: ruby #{File.basename(__FILE__)} [options]"
+        opts.on("--admin-root PATH", "Organizer/admin package root. Defaults to script root.") { |value| options[:admin_root] = File.expand_path(value) }
+        opts.on("--participant-tree PATH", "Extracted participant source tree.") { |value| options[:participant_tree] = File.expand_path(value) }
+        opts.on("--evidence PATH", "Write JSON evidence to PATH.") { |value| options[:evidence] = File.expand_path(value) }
+        opts.on("--keep-tmp", "Keep temporary mutant trees for debugging.") { options[:keep_tmp] = true }
+        opts.on("-h", "--help", "Show this help.") do
+          puts opts
+          exit 0
+        end
+      end
+      parser.parse!(argv)
+
+      validator = Validator.new(options)
+      evidence = validator.run
+      write_json(options[:evidence], evidence)
+      puts JSON.pretty_generate(summary(evidence))
+      exit(evidence[:ok] ? 0 : 1)
+    end
+
+    def auto_participant_tree
+      if File.directory?(INTERNAL_PARTICIPANT_TREE)
+        INTERNAL_PARTICIPANT_TREE
+      else
+        DEFAULT_PARTICIPANT_TREE
+      end
+    end
+
+    def write_json(path, object)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, JSON.pretty_generate(object))
+    end
+
+    def summary(evidence)
+      {
+        ok: evidence[:ok],
+        participant_tree: evidence[:participant_tree],
+        admin_root: evidence[:admin_root],
+        failures: evidence[:failures],
+        normal_checker: evidence.dig(:normal, :ok),
+        mutants: evidence[:mutants].transform_values { |row| row[:ok] }
+      }
+    end
+
+    class Validator
+      def initialize(options)
+        @participant_tree = options.fetch(:participant_tree)
+        @admin_root = options.fetch(:admin_root)
+        @evidence = options.fetch(:evidence)
+        @keep_tmp = options.fetch(:keep_tmp)
+        @python = ENV.fetch("PYTHON", "python")
+        @checker_credential = ENV.fetch("VOLTAX_CHECKER_SECRET", "w22-c-local-checker-credential")
+      end
+
+      def run
+        evidence = {
+          generated_at: Time.now.utc.iso8601,
+          participant_tree: @participant_tree,
+          participant_tree_sha256: tree_digest(@participant_tree),
+          admin_root: @admin_root,
+          admin_root_sha256: tree_digest(@admin_root),
+          normal: nil,
+          mutants: {}
+        }
+        raise "participant tree not found: #{@participant_tree}" unless File.directory?(@participant_tree)
+        raise "admin checker not found under #{@admin_root}" unless File.file?(File.join(@admin_root, CHECKER_PATH))
+
+        with_participant_copy("w22c-normal") do |tree|
+          stand = Stand.new(tree, "w22c-normal", @checker_credential)
+          begin
+            stand.start!
+            evidence[:normal] = checker_pair(stand.host)
+          ensure
+            stand.stop!
+          end
+        end
+
+        MUTANTS.each do |ex_id, mutant|
+          evidence[:mutants][ex_id] = run_mutant(ex_id, mutant)
+        end
+
+        evidence[:failures] = collect_failures(evidence)
+        evidence[:ok] = evidence[:failures].empty?
+        evidence
+      rescue StandardError => error
+        {
+          generated_at: Time.now.utc.iso8601,
+          participant_tree: @participant_tree,
+          admin_root: @admin_root,
+          ok: false,
+          failures: ["validator setup failed"],
+          error: error.message[0, 4000]
+        }
+      end
+
+      private
+
+      def run_mutant(ex_id, mutant)
+        with_participant_copy("w22c-#{ex_id.downcase}") do |tree|
+          mutation = apply_mutation(tree, mutant)
+          stand = Stand.new(tree, "w22c-#{ex_id.downcase.gsub(/[^a-z0-9]/, "")}", @checker_credential)
+          begin
+            stand.start!
+            checks = checker_pair(stand.host)
+            expected_failure = !checks[:check][:ok] && !checks[:havoc][:ok]
+            {
+              ok: expected_failure,
+              ex_id: ex_id,
+              surface: mutant.fetch(:surface),
+              mutation: mutation,
+              expected: "checker check and havoc fail after crude disable",
+              check: checks[:check],
+              havoc: checks[:havoc]
+            }
+          ensure
+            stand.stop!
+          end
+        end
+      rescue StandardError => error
+        {
+          ok: false,
+          ex_id: ex_id,
+          surface: mutant.fetch(:surface),
+          error: error.message[0, 4000]
+        }
+      end
+
+      def apply_mutation(tree, mutant)
+        path = File.join(tree, mutant.fetch(:file))
+        raise "mutant source file missing: #{mutant.fetch(:file)}" unless File.file?(path)
+
+        content = File.read(path, encoding: "UTF-8")
+        changed = content.dup
+        mutant.fetch(:replacements).each do |before, after|
+          raise "mutation pattern missing in #{mutant.fetch(:file)}: #{before}" unless changed.include?(before)
+
+          changed = changed.sub(before, after)
+        end
+        File.write(path, changed)
+        {
+          file: mutant.fetch(:file),
+          sha256_before: Digest::SHA256.hexdigest(content).upcase,
+          sha256_after: Digest::SHA256.hexdigest(changed).upcase,
+          replacements: mutant.fetch(:replacements).map { |before, after| { before: before, after: after } }
+        }
+      end
+
+      def checker_pair(host)
+        {
+          check: run_checker("check", host),
+          havoc: run_checker("havoc", host)
+        }.tap do |rows|
+          rows[:ok] = rows[:check][:ok] && rows[:havoc][:ok]
+        end
+      end
+
+      def run_checker(action, host)
+        row = command(
+          "checker #{action}",
+          [@python, CHECKER_PATH, action, host],
+          chdir: @admin_root,
+          env: {
+            "VOLTAX_CHECKER_SECRET" => @checker_credential,
+            "VOLTAX_CHECKER_POLICY" => "competition",
+            "PYTHONDONTWRITEBYTECODE" => "1"
+          }
+        )
+        row[:ok] = row[:exitstatus] == 101
+        row
+      end
+
+      def with_participant_copy(name)
+        temp_root = Dir.mktmpdir("voltax-#{name}-")
+        tree = File.join(temp_root, "voltax-exchange-team")
+        FileUtils.cp_r(@participant_tree, tree)
+        yield tree
+      ensure
+        FileUtils.rm_rf(temp_root) if temp_root && !@keep_tmp
+      end
+
+      def command(label, argv, chdir:, env: {})
+        stdout, stderr, status = Open3.capture3(env.merge("PYTHONDONTWRITEBYTECODE" => "1"), *argv, chdir: chdir)
+        {
+          ok: status.success?,
+          label: label,
+          stdout: redact(stdout[0, 4000]),
+          stderr: redact(stderr[0, 4000]),
+          exitstatus: status.exitstatus
+        }
+      end
+
+      def collect_failures(evidence)
+        failures = []
+        normal = evidence[:normal]
+        failures << "normal participant checker did not pass" unless normal.is_a?(Hash) && normal[:ok]
+        evidence.fetch(:mutants).each do |ex_id, row|
+          failures << "#{ex_id} crude disable did not fail checker as expected" unless row[:ok]
+        end
+        failures
+      end
+
+      def tree_digest(root)
+        return nil unless File.directory?(root)
+
+        digest = Digest::SHA256.new
+        Dir.chdir(root) do
+          Dir.glob("**/*", File::FNM_DOTMATCH).select { |entry| File.file?(entry) }.sort.each do |relative|
+            next if relative.start_with?(".git/")
+
+            digest.update(relative)
+            digest.update("\0")
+            digest.update(File.binread(relative))
+            digest.update("\0")
+          end
+        end
+        digest.hexdigest.upcase
+      end
+
+      def redact(value)
+        value.to_s.gsub(@checker_credential, "[checker-credential]")
+      end
+    end
+
+    class Stand
+      attr_reader :host
+
+      def initialize(tree, project_name, checker_credential)
+        @tree = tree
+        @project_name = project_name
+        @checker_credential = checker_credential
+        @port = free_port
+        @host = "http://127.0.0.1:#{@port}"
+      end
+
+      def start!
+        rewrite_compose_port!
+        compose("down", "--remove-orphans", "-v")
+        compose("build")
+        migrate!
+        compose("up", "-d")
+        wait_for_health!
+      end
+
+      def stop!
+        compose("down", "--remove-orphans", "-v")
+      end
+
+      private
+
+      def compose(*args)
+        result = compose_result(*args)
+        raise "docker compose #{args.join(' ')} failed: #{result[:stdout]}\n#{result[:stderr]}" unless result[:ok]
+
+        result
+      end
+
+      def compose_result(*args)
+        env = {
+          "VOLTAX_SECRET_KEY_BASE" => "w22-c-validation-credential-key-base-#{@project_name}-local",
+          "VOLTAX_POSTGRES_PASSWORD" => "w22-c-postgres-#{@project_name}",
+          "VOLTAX_CHECKER_SECRET" => @checker_credential,
+          "COMPOSE_PROJECT_NAME" => @project_name
+        }
+        stdout, stderr, status = Open3.capture3(env, "docker", "compose", "--project-name", @project_name, *args, chdir: @tree)
+        { ok: status.success?, stdout: stdout, stderr: stderr, status: status.exitstatus }
+      end
+
+      def migrate!
+        normal = compose_result("run", "--rm", "exchange-api", "migrate")
+        return normal if normal[:ok]
+        raise "docker compose run --rm exchange-api migrate failed: #{normal[:stdout]}\n#{normal[:stderr]}" unless normal[:stderr].include?("No Rakefile")
+
+        code = <<~RUBY
+          require_relative "config/environment"
+          require_relative "lib/voltax/db"
+          VoltaX::DB.with_connection { |database| VoltaX::DB.migrate(database: database) }
+          puts "Database migrations complete"
+        RUBY
+        compose("run", "--rm", "exchange-api", "ruby", "-e", code)
+      end
+
+      def wait_for_health!
+        deadline = Time.now + 90
+        uri = URI.join(@host, "/health")
+        loop do
+          begin
+            response = Net::HTTP.get_response(uri)
+            return if response.code.to_i.between?(200, 299)
+          rescue StandardError
+            nil
+          end
+          raise "service did not become healthy at #{@host}" if Time.now > deadline
+
+          sleep 1
+        end
+      end
+
+      def rewrite_compose_port!
+        compose_path = File.join(@tree, "docker-compose.yml")
+        content = File.read(compose_path, encoding: "UTF-8")
+        content = content.gsub(/-\s+"(?:127\.0\.0\.1:)?\d+:9292"/, "- \"127.0.0.1:#{@port}:9292\"")
+        File.write(compose_path, content)
+      end
+
+      def free_port
+        server = TCPServer.new("127.0.0.1", 0)
+        server.addr[1]
+      ensure
+        server&.close
+      end
+    end
+  end
+end
+
+Release::ValidateCoarseDisableMatrix.run(ARGV) if $PROGRAM_NAME == __FILE__

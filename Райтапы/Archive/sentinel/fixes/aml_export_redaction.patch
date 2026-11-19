@@ -1,0 +1,11 @@
+diff --git a/internal/exporting/export_linked_evidence.go b/internal/exporting/export_linked_evidence.go
+--- a/internal/exporting/export_linked_evidence.go
++++ b/internal/exporting/export_linked_evidence.go
+@@ -8,6 +8,6 @@ func appendExportLinkedCaseData(bundle *ExportBundle, _ CaseSnapshot, linkedCas
+ 		return
+ 	}
+ 	for _, linked := range linkedCases {
+-		appendExportSourceMaterials(bundle, linked.SourceMaterials, traversal.Root)
++		appendExportSourceMaterials(bundle, linked.SourceMaterials, traversal.Linked)
+ 	}
+ }

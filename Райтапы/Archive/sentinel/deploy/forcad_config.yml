@@ -1,0 +1,8 @@
+tasks:
+  - name: sentinel_aml
+    checker: sentinel_aml/checker.py
+    checker_type: pfr
+    checker_timeout: 30
+    places: 2
+    puts: 2
+    gets: 2

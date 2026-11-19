@@ -1,0 +1,9 @@
+tasks:
+  - name: the_car
+    checker: checker/checker.py
+    checker_type: pfr
+    checker_timeout: 20
+    places: 6
+    puts: 1
+    gets: 1
+    default_score: 2500

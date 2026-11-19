@@ -1,0 +1,16 @@
+# Необязательная альтернатива правке существующего Compose ForcAD.
+# Основной путь из DEPLOY.txt обходится без этого файла. Командам он не нужен.
+# Если выбрали этот способ: замените <...> и добавьте файл последним через -f.
+services:
+  <WORKER_SERVICE>:
+    volumes:
+      - type: bind
+        source: "<CHECKER_DIR_ON_HOST>"
+        target: "<CHECKER_DIR_IN_WORKER>"
+        read_only: true
+      - type: bind
+        source: "<PRIVATE_KEYS_DIR_ON_HOST>"
+        target: /run/secrets/the_car
+        read_only: true
+    environment:
+      CHECKER_KEYS_FILE: /run/secrets/the_car/checker-keys.json
