@@ -12,6 +12,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
+import os
 import re
 import secrets
 import shutil
@@ -42,6 +43,11 @@ BROWSERS = (
     "google-chrome",
     "google-chrome-stable",
     "brave-browser",
+    "microsoft-edge",
+    "microsoft-edge-stable",
+    "msedge",
+    "vivaldi",
+    "opera",
 )
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 REFERENCE_HEADING = re.compile(r"(?m)^##\s+((CAR|EX|AML)-(\d+)):\s*(.+?)\s*$")
@@ -57,6 +63,18 @@ SOURCE_EXTENSIONS = {".py", ".go", ".rb", ".c", ".js", ".jsx", ".ts", ".tsx", ".
 SKIP_DIRS = {".git", ".venv", "venv", "vendor", "node_modules", "dist", "build", "__pycache__", "coverage"}
 
 
+def default_profile_root() -> Path:
+    """Return the platform's conventional per-user cache directory."""
+    if sys.platform == "win32":
+        cache_root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        cache_root = Path.home() / "Library" / "Caches"
+    else:
+        xdg_cache = os.environ.get("XDG_CACHE_HOME")
+        cache_root = Path(xdg_cache) if xdg_cache and Path(xdg_cache).is_absolute() else Path.home() / ".cache"
+    return cache_root / "chataudit" / "browser-profiles"
+
+
 def find_browser(explicit: str | None) -> str:
     candidates = (explicit,) if explicit else BROWSERS
     for candidate in candidates:
@@ -64,10 +82,28 @@ def find_browser(explicit: str | None) -> str:
         if path:
             return path
         candidate_path = Path(candidate).expanduser()
-        if candidate_path.is_file() and candidate_path.stat().st_mode & 0o111:
+        if candidate_path.is_file() and (os.name == "nt" or os.access(candidate_path, os.X_OK)):
             return str(candidate_path)
-    names = ", ".join(candidates)
-    raise SystemExit(f"No supported Chromium browser found ({names}). Pass --browser /path/to/browser.")
+    if explicit:
+        raise SystemExit(f"Browser executable not found or not executable: {explicit}")
+    names = ", ".join(BROWSERS)
+    raise SystemExit(
+        f"No Chromium-based browser found in PATH ({names}). Install Chromium, Chrome, Brave, Edge, Vivaldi, or Opera, "
+        "or pass --browser /path/to/browser."
+    )
+
+
+def start_browser(command: list[str]) -> subprocess.Popen[bytes]:
+    options: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        options["start_new_session"] = True
+    return subprocess.Popen(command, **options)
 
 
 def choose_debugging_port() -> int:
@@ -1177,45 +1213,67 @@ def set_chat_model(client: DevToolsWebSocket, provider: str, model: str) -> bool
         read_current = """(() => {
           const e = document.querySelector('[aria-label="Select Model"]')
             || document.querySelector('[aria-label^="Models "] .mms-trigger__name')
-            || document.querySelector('.mms-trigger__name');
+            || document.querySelector('.mms-trigger__name')
+            || document.querySelector('.wms-trigger__text');
           return e?.innerText.trim();
         })()"""
         trigger_expression = (
             "document.querySelector('[aria-label=\"Select Model\"]')"
             " || document.querySelector('[aria-label^=\"Models \"]')"
+            " || document.querySelector('.wms-trigger')"
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            current = client.evaluate(read_current)
-            if isinstance(current, str) and current == model:
-                return True
-            if isinstance(current, str):
-                break
-            time.sleep(0.25)
-        if not isinstance(current, str):
-            return False
-        if not click_visible_element(client, trigger_expression):
-            return False
         option_expression = (
             "[...document.querySelectorAll('.wms-list__name-text, .mms-list__name-text')]"
             f".find(e => e.innerText.trim() === {model_json})"
         )
-        option_exists = f"!!({option_expression})"
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if client.evaluate(option_exists):
-                break
-            time.sleep(0.2)
-        clicked = client.evaluate(
-            f"(() => {{ const e = {option_expression}; if (!e) return false; e.click(); return true; }})()"
-        )
-        if not clicked:
-            return False
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if client.evaluate(read_current) == model:
-                return True
-            time.sleep(0.2)
+        for _attempt in range(3):
+            deadline = time.monotonic() + 15
+            current = None
+            while time.monotonic() < deadline:
+                current = client.evaluate(read_current)
+                if isinstance(current, str) and current == model:
+                    return True
+                if isinstance(current, str):
+                    break
+                time.sleep(0.25)
+            if not isinstance(current, str):
+                time.sleep(0.5)
+                continue
+
+            menu_open = client.evaluate(
+                "!!document.querySelector('.wms-trigger--open, .mms-trigger--open')"
+            ) is True
+            if not menu_open and not click_visible_element(client, trigger_expression):
+                # Qwen's current model trigger is a div with a click handler;
+                # a DOM click is a fallback when hit-testing misses its target.
+                client.evaluate(
+                    f"(() => {{ const e = {trigger_expression}; if (!e) return false; "
+                    "const r=e.getBoundingClientRect(),s=getComputedStyle(e); "
+                    "if (!r.width || !r.height || s.display==='none' || s.visibility==='hidden') return false; "
+                    "e.click(); return true; })()"
+                )
+
+            visible_option = (
+                f"(() => {{ const e = {option_expression}; if (!e) return false; "
+                "const r=e.getBoundingClientRect(),s=getComputedStyle(e); "
+                "return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; })()"
+            )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and client.evaluate(visible_option) is not True:
+                time.sleep(0.25)
+            clicked = client.evaluate(
+                f"(() => {{ const e = {option_expression}; if (!e) return false; "
+                "const r=e.getBoundingClientRect(),s=getComputedStyle(e); "
+                "if (!r.width || !r.height || s.display==='none' || s.visibility==='hidden') return false; "
+                "e.click(); return true; })()"
+            )
+            if clicked:
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    if client.evaluate(read_current) == model:
+                        return True
+                    time.sleep(0.25)
+            time.sleep(0.5)
         return False
 
     if provider == "zai":
@@ -1406,7 +1464,8 @@ def wait_for_response(
                 current_model = client.evaluate("""(() => {
                   const e = document.querySelector('[aria-label="Select Model"]')
                     || document.querySelector('[aria-label^="Models "] .mms-trigger__name')
-                    || document.querySelector('.mms-trigger__name');
+                    || document.querySelector('.mms-trigger__name')
+                    || document.querySelector('.wms-trigger__text');
                   return e?.innerText.trim();
                 })()""")
                 if current_model != model and not set_chat_model(client, provider, model):
@@ -1534,7 +1593,7 @@ def launch(args: argparse.Namespace, material: str | None, submit: bool = False,
                 )
             command.append(url)
             try:
-                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                process = start_browser(command)
                 if material is not None:
                     _, websocket_url = devtools_page(profile, url, process, debugging_port)
                     client = DevToolsWebSocket(websocket_url)
@@ -1616,7 +1675,7 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                         "--new-window",
                         url,
                     ]
-                    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    process = start_browser(command)
                 else:
                     debugging_port = attach_port
                 resolved_port, websocket_url = devtools_page(profile, url, process, debugging_port)
@@ -1684,6 +1743,10 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                             (trace_path.parent / f"{provider.upper()}_{pass_name}_{context_name}.md").write_text(previous_reply["answer"].rstrip() + "\n", encoding="utf-8")
                         elif previous_label == "final-findings":
                             (trace_path.parent / f"{provider.upper()}_FINDINGS_{context_name}.md").write_text(previous_reply["answer"].rstrip() + "\n", encoding="utf-8")
+                        elif previous_label.startswith(("focus-review-", "solver-patch-")) or previous_label in {"context-ready", "solution-followup"}:
+                            answer_path = trace_path.parent / f"{provider.upper()}_{previous_label}_{context_name}.md"
+                            answer_path.write_text(previous_reply["answer"].rstrip() + "\n", encoding="utf-8")
+                            print(f"{context_name}: saved response to {answer_path}.", flush=True)
 
                 for index, (label, material) in enumerate(messages[resume_after:], resume_after + 1):
                     marker = material.split("\n", 1)[0]
@@ -1694,6 +1757,12 @@ def launch_sequence(args: argparse.Namespace, messages: list[tuple[str, str]], t
                         events = client.pump_network_events(0.2)
                         write_trace(trace_path, context_name, label, len(material), events, False)
                         print(f"{context_name}: challenge/composer did not clear; stopped before sending this message.", file=sys.stderr, flush=True)
+                        break
+                    if provider == "qwen" and not set_chat_model(client, provider, desired_model):
+                        failures += 1
+                        events = client.pump_network_events(0.2)
+                        write_trace(trace_path, context_name, label, len(material), events, "requested model unavailable")
+                        print(f"{context_name}: could not confirm {desired_model} for {label}; stopped before sending.", file=sys.stderr, flush=True)
                         break
                     if not fill_composer(client, material, args.captcha_wait):
                         failures += 1
@@ -1828,8 +1897,8 @@ def add_launch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile-root",
         type=Path,
-        default=Path.home() / "snap" / "chromium" / "common" / "chataudit-chat-contexts",
-        help="directory for fresh browser profiles (default: ~/snap/chromium/common/chataudit-chat-contexts)",
+        default=default_profile_root(),
+        help="directory for isolated browser profiles (default: platform cache directory)",
     )
 
 
@@ -2120,30 +2189,42 @@ class CLIHelpFormatter(argparse.RawDescriptionHelpFormatter):
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
-    top_description = """Audit one CTF service through visible Qwen or Z.ai chats.
+    top_description = """Review a CTF service through visible Qwen or Z.ai chats.
 
-The CLI collects source files, builds ordered prompts, and sends them through a visible Chromium browser. Verification may require action in that browser. Conversations stay open when finished."""
-    top_epilog = """QUICK START
-  Preview included files and generated messages (no browser):
+Requires Python 3.10+ and a Chromium-based browser (Chromium, Chrome, Brave, Edge, Vivaldi, or Opera) available in PATH. No Python packages are required. A graphical desktop is needed because chats and any verification prompts open visibly. PDF files are optional; install poppler-utils to extract them."""
+    top_epilog = """EXAMPLES BY FLOW
+  Open empty provider chats:
+    python3 manual_chat_contexts.py open --task demo --provider qwen
+
+  Fill a chat with a prompt and one or more files (add --submit to send it):
+    python3 manual_chat_contexts.py ask --task demo --provider qwen --prompt "Review this handler" --file ./task/handler.py
+
+  Preview collected files and prompt chunks without opening a browser:
     python3 manual_chat_contexts.py prepare --folder ./task
 
-  Run the default whole-service audit in one Qwen chat:
-    python3 manual_chat_contexts.py audit --folder ./task --provider qwen
-
-  Ask that same chat for structured findings, then continue it for solvers/patches:
+  Audit the whole service (default mode); request machine-readable findings:
     python3 manual_chat_contexts.py audit --folder ./task --provider qwen --structured-findings
-    python3 manual_chat_contexts.py continue --task task --provider qwen --attach-profile PROFILE/qwen-1
 
-  Or create one fresh solver/patch chat per finding:
+  Opt into per-file audit sessions; each session has full source context:
+    python3 manual_chat_contexts.py audit --folder ./task --provider qwen --granulize=5 --parallel-sessions=2
+
+  Prefill a chat for free discussion about the service:
+    python3 manual_chat_contexts.py context --folder ./task --provider qwen
+
+  Continue an audit chat to request solver and patch material:
+    python3 manual_chat_contexts.py continue --task demo --provider qwen --attach-profile PROFILE/qwen-1
+  Add --scope solver or --scope patch for one deliverable, or --findings-json findings.json.
+
+  Create one full-context solver/patch chat per finding:
     python3 manual_chat_contexts.py solve --folder ./task --provider qwen --findings-json findings.json
 
-WORKFLOWS
-  audit       Whole-service review by default; --granulize=N opts into file-focused sessions.
-  context     Load source into a chat and leave it ready for your questions.
-  continue    Continue solver/patch work in an existing audit conversation.
-  solve       Start a full-context solver/patch conversation for each finding.
-
-Use 'COMMAND --help' for command-specific options and examples. For commands that accept --provider, omission selects both Qwen and Z.ai; continue requires exactly one. Default UI models are Qwen 3.8 Max and GLM 5.3 Flash."""
+WORKFLOW NOTES
+  Start with audit; solver and patch work is requested separately with continue or solve.
+  For commands that accept --provider, omission selects both Qwen and Z.ai; continue requires one provider.
+  Finished browser windows stay open. Close them when you are done. Use 'COMMAND --help' for details.
+  Default UI models are Qwen 3.8 Max and GLM 5.3 Flash. Profiles use the platform cache directory;
+  set --profile-root to choose another location. On Ubuntu, PDF extraction is enabled by:
+    sudo apt install poppler-utils"""
     parser = argparse.ArgumentParser(
         description=top_description,
         epilog=top_epilog,
@@ -2219,7 +2300,7 @@ Use 'COMMAND --help' for command-specific options and examples. For commands tha
             if command == "audit":
                 job_parser.add_argument("--parallel-sessions", type=int, default=2, help="granular session plans driven concurrently; completed browser windows remain open")
             job_parser.add_argument("--browser", help="Chromium-based browser executable; auto-detected by default")
-            job_parser.add_argument("--profile-root", type=Path, default=Path.home() / "snap" / "chromium" / "common" / "chataudit-chat-contexts", help="directory for fresh browser profiles (default: ~/snap/chromium/common/chataudit-chat-contexts)")
+            job_parser.add_argument("--profile-root", type=Path, default=default_profile_root(), help="directory for isolated browser profiles (default: platform cache directory)")
             job_parser.add_argument("--captcha-wait", type=int, default=180, help="seconds to wait for a composer, allowing manual CAPTCHA solving")
             job_parser.add_argument("--wait-after-submit", type=int, default=600, help="maximum seconds to wait for visible completion controls")
             add_model_options(job_parser)
@@ -2268,7 +2349,7 @@ Use 'COMMAND --help' for command-specific options and examples. For commands tha
     solve_parser.add_argument("--replicas", type=int, default=1, help="independent contexts per provider for each finding")
     solve_parser.add_argument("--parallel-sessions", type=int, default=2, help="finding session plans driven concurrently; finished windows remain open")
     solve_parser.add_argument("--browser", help="Chromium-based browser executable; auto-detected by default")
-    solve_parser.add_argument("--profile-root", type=Path, default=Path.home() / "snap" / "chromium" / "common" / "chataudit-chat-contexts", help="directory for fresh browser profiles (default: ~/snap/chromium/common/chataudit-chat-contexts)")
+    solve_parser.add_argument("--profile-root", type=Path, default=default_profile_root(), help="directory for isolated browser profiles (default: platform cache directory)")
     solve_parser.add_argument("--captcha-wait", type=int, default=180, help="seconds to wait for a ready chat composer")
     solve_parser.add_argument("--wait-after-submit", type=int, default=600, help="maximum seconds to wait for the model response")
     add_model_options(solve_parser)
