@@ -282,3 +282,18 @@ No prompt, response, cookie, authorization header, or WebSocket payload contents
 | Event | Host | Path | Method | Status | Has body | Request bytes | Response/frame bytes | Error |
 |---|---|---|---|---:|---|---:|---:|---|
 | responseReceived | chat.qwen.ai | /api/v2/chat/completions | POST | 200 |  |  |  |  |
+
+## qwen-1: final-findings
+
+- Prompt characters: 32846
+- UI settled: in progress
+
+| Event | Host | Path | Method | Status | Has body | Request bytes | Response/frame bytes | Error |
+|---|---|---|---|---:|---|---:|---:|---|
+| loadingFinished | chat.qwen.ai | /api/v2/chat/completions | POST |  |  |  | 15695 |  |
+
+## qwen-1: final-findings
+
+- Prompt characters: 32846
+- UI settled: True
+- No Network-domain events observed in this interval.
