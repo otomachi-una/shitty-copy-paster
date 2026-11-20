@@ -1,0 +1,42 @@
+{
+  "F1": {
+    "status": "confirmed",
+    "title": "IDOR in order reference lookup",
+    "file": "lib/voltax/reference_directory.rb",
+    "evidence": "GET /api/orders/lookup/:reference_code flows through OrderReferenceResolver with channel :desk_order, forcing the global desk_book branch. The repository lookup filters only by client_order_id and drops account ownership before serializing the order.",
+    "preconditions": "Authenticated account with the orders capability and a known or guessable client_order_id belonging to another account.",
+    "impact": "Read cross-account order data, including price, quantity, status, and execution memo."
+  },
+  "F2": {
+    "status": "confirmed",
+    "title": "Counterparty booking reference leak in trade detail",
+    "file": "lib/voltax/presenters/trade_presenter.rb",
+    "evidence": "A participant-scoped trade detail fetches every booking for the trade, selects the other participant row, and emits its client_reference as desk_ref without an audience check.",
+    "preconditions": "Authenticated participant in a trade with a counterparty booking reference.",
+    "impact": "Read the counterparty’s private booking reference through trade detail."
+  },
+  "F3": {
+    "status": "confirmed",
+    "title": "Counterparty booking references leak in broker reports",
+    "file": "lib/voltax/services/broker_report_service.rb",
+    "evidence": "Broker report enrichment reads both receipts for a trade and places the other participant's booking reference in the report booking_marker.",
+    "preconditions": "Access to an eligible broker trade report containing a trade with two participant receipts.",
+    "impact": "Read client_reference values from both sides of reported trades."
+  },
+  "F4": {
+    "status": "confirmed",
+    "title": "Conditional-order strategy context enters the public feed",
+    "file": "lib/voltax/dtos/activation_context_dto.rb",
+    "evidence": "ActivationContextDTO includes the conditional order signal_context in activation_context, which is persisted and expanded into public feed event attributes without redaction.",
+    "preconditions": "A user creates a conditional order with signal_context and the order is triggered; reading the public feed requires no authentication.",
+    "impact": "Disclose private strategy notes to unauthenticated feed readers."
+  },
+  "F5": {
+    "status": "needs-context",
+    "title": "RFQ workup may expose private delivery terms",
+    "file": "lib/voltax/dtos/quote_workup_dto.rb",
+    "evidence": "The prior audit noted that GET /api/rfq/:rfq_id/workup allows any account with rfq_quote capability to receive delivery_terms for any RFQ. It was left unresolved because the intended audience and effect on quote calculation were not established.",
+    "preconditions": "Authenticated account with rfq_quote capability and an RFQ owned by another account.",
+    "impact": "Potential disclosure of private OTC terms or influence on quote calculations, pending verification of the source flow and intended access policy."
+  }
+}
